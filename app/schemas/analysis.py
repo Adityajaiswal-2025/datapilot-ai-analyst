@@ -84,3 +84,32 @@ class CompareResponse(BaseResponse):
     dataset_ids: List[str] = Field(description="List of dataset IDs compared")
     comparison_details: Dict[str, Any] = Field(description="Structured side-by-side comparative metadata and statistics")
     warnings: List[str] = Field(default_factory=list, description="Schema mismatch or data quality warnings")
+
+
+class DatasetMetricDelta(BaseModel):
+    """Structured metric comparison result between two datasets."""
+    metric_column: str = Field(description="Column name compared")
+    dataset_1_id: str = Field(description="ID of baseline dataset")
+    dataset_2_id: str = Field(description="ID of comparison dataset")
+    dataset_1_value: float = Field(description="Computed quantitative metric in dataset 1")
+    dataset_2_value: float = Field(description="Computed quantitative metric in dataset 2")
+    absolute_delta: float = Field(description="Exact difference (dataset_2_value - dataset_1_value)")
+    percentage_delta: Optional[float] = Field(default=None, description="Percentage change ((V2 - V1) / abs(V1) * 100.0) if baseline != 0")
+    aggregation: str = Field(default="sum", description="Aggregation function applied (e.g. sum, mean, count)")
+
+
+class ComparisonMetricRequest(BaseModel):
+    """Request schema for quantitative metric comparison across 2 or more datasets."""
+    dataset_ids: List[str] = Field(description="List of 2 or more dataset IDs to compare", min_length=2)
+    metric_column: str = Field(description="Numeric or count column to compare across datasets")
+    aggregation: Literal["sum", "mean", "count"] = Field(default="sum", description="Aggregation function to evaluate metric")
+
+
+class ComparisonMetricResponse(BaseResponse):
+    """Response schema for quantitative metric comparison across datasets."""
+    dataset_ids: List[str] = Field(description="List of dataset IDs compared")
+    metric_column: str = Field(description="Column evaluated")
+    deltas: List[DatasetMetricDelta] = Field(default_factory=list, description="Pairwise metric deltas across datasets")
+    execution_status: Literal["success", "partial_success", "failed"] = Field(default="success")
+    warnings: List[str] = Field(default_factory=list, description="Any validation or schema warnings")
+

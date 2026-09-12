@@ -25,7 +25,11 @@ class SandboxSecurityError(Exception):
 
 
 def validate_code_security(code: str) -> List[str]:
-    """Inspects Python code via AST parsing and returns a list of security policy violations."""
+    """Inspects Python code via AST parsing and returns a list of security policy violations.
+
+    SECURITY NOTE: Hard OS memory capping (cgroups/RLIMIT_AS) is not natively available on Windows
+    without OS job objects. The sandbox enforces strict AST static validation and execution timeout limits.
+    """
     violations: List[str] = []
 
     try:
@@ -48,7 +52,7 @@ def validate_code_security(code: str) -> List[str]:
                 if mod_base in DISALLOWED_IMPORTS:
                     violations.append(f"Prohibited import: module '{node.module}' is not allowed.")
 
-        # 3. Inspect function calls (eval(), exec(), open())
+        # 3. Inspect function calls (eval(), exec(), open(), compile())
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
                 if node.func.id in DISALLOWED_BUILTINS:
@@ -57,12 +61,17 @@ def validate_code_security(code: str) -> List[str]:
                 if node.func.attr in DISALLOWED_BUILTINS:
                     violations.append(f"Prohibited method call: '.{node.func.attr}()' is not allowed.")
 
-        # 4. Inspect dunder attribute access (__subclasses__, __globals__)
+        # 4. Inspect dunder attribute access (__subclasses__, __globals__, __class__)
         elif isinstance(node, ast.Attribute):
-            if node.attr in DISALLOWED_ATTRIBUTES:
-                violations.append(f"Prohibited attribute access: '{node.attr}' is not allowed.")
+            if node.attr in DISALLOWED_ATTRIBUTES or (node.attr.startswith("__") and node.attr.endswith("__")):
+                violations.append(f"Prohibited dunder attribute access: '{node.attr}' is not allowed.")
+
+        # 5. Inspect global/nonlocal declarations
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            violations.append(f"Prohibited statement: '{type(node).__name__}' is not allowed in sandbox.")
 
     return violations
+
 
 
 def _run_in_restricted_env(code: str, target_df: Optional[pd.DataFrame]) -> Dict[str, Any]:
@@ -84,6 +93,7 @@ def _run_in_restricted_env(code: str, target_df: Optional[pd.DataFrame]) -> Dict
         "pd": pd,
         "np": np,
         "math": math,
+        "time": time,
         "datetime": datetime,
         "re": re,
         "json": json,
@@ -188,19 +198,21 @@ def execute_sandboxed_code(
         }
 
     # Step 3: Execute in ThreadPoolExecutor for Timeout Enforcement
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_run_in_restricted_env, code, target_df)
-        try:
-            res = future.result(timeout=timeout_seconds)
-            res["security_violations"] = []
-            res["execution_time_seconds"] = round(time.time() - start_time, 4)
-            return res
-        except TimeoutError:
-            return {
-                "success": False,
-                "security_violations": [],
-                "stdout": "",
-                "result": None,
-                "execution_time_seconds": round(time.time() - start_time, 4),
-                "error": f"Execution timed out after {timeout_seconds} second(s).",
-            }
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_run_in_restricted_env, code, target_df)
+    try:
+        res = future.result(timeout=timeout_seconds)
+        res["security_violations"] = []
+        res["execution_time_seconds"] = round(time.time() - start_time, 4)
+        executor.shutdown(wait=False)
+        return res
+    except TimeoutError:
+        executor.shutdown(wait=False, cancel_futures=True)
+        return {
+            "success": False,
+            "security_violations": [],
+            "stdout": "",
+            "result": None,
+            "execution_time_seconds": round(time.time() - start_time, 4),
+            "error": f"Execution timed out after {timeout_seconds} second(s).",
+        }

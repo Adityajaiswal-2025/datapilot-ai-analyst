@@ -17,7 +17,7 @@ DISALLOWED_IMPORTS: Set[str] = {
 DISALLOWED_BUILTINS: Set[str] = {
     "eval", "exec", "open", "__import__", "globals", "locals",
     "getattr", "setattr", "delattr", "compile", "breakpoint",
-    "exit", "quit", "input", "memoryview"
+    "exit", "quit", "input", "memoryview", "vars"
 }
 
 DISALLOWED_ATTRIBUTES: Set[str] = {

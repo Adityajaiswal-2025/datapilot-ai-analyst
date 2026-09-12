@@ -73,6 +73,10 @@ def sanitize_for_json(val: Any) -> Any:
     """Converts Pandas/NumPy NaN/Inf or non-serializable values into JSON safe formats."""
     if pd.isna(val) or val is None:
         return None
+    if isinstance(val, dict):
+        return {str(k): sanitize_for_json(v) for k, v in val.items()}
+    if isinstance(val, (list, tuple)):
+        return [sanitize_for_json(v) for v in val]
     if isinstance(val, (np.integer, int)):
         return int(val)
     if isinstance(val, (np.floating, float)):

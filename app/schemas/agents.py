@@ -124,6 +124,11 @@ class InsightOutput(BaseModel):
         default_factory=list,
         description="Structured machine-readable business insights with evidence metadata"
     )
+    suggested_followups: List[str] = Field(
+        default_factory=list,
+        description="Context-aware suggested follow-up queries derived from actual empirical findings"
+    )
+
 
 
 class AgentQueryRequest(BaseModel):

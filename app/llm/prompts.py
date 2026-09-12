@@ -45,6 +45,8 @@ Guidelines:
 - Reference ONLY column names present in the dataset schema.
 - Numeric aggregations ('sum', 'mean', 'std', 'min', 'max') MUST be applied ONLY to numeric columns (int/float). Categorical/string columns MUST NOT be aggregated with 'sum' or 'mean'.
 - For total / highest / top queries (e.g. "highest total sales"), aggregate numeric metric with 'sum', set 'sort_by' to the metric column, and set 'sort_direction': "descending".
+- For order count or record count ranking queries (e.g. "highest number of orders by state", "most orders by city"), use 'group_data' with 'group_by': [dimension], 'aggregations': {order_id_column: ['count']}, 'sort_by': order_id_column + '_count', 'sort_direction': "descending".
+- For temporal queries (e.g. "How many orders were placed each month?", "monthly order trend", "which month had highest orders"), use 'group_data' on the date column with 'time_grain': "month"|"year"|"quarter"|"week"|"day", 'aggregations': {metric: ['count'|'sum']}, 'sort_by': metric + '_count' (or chronologically sorted). NEVER return an ungrouped aggregate_data count when a temporal period breakdown is requested.
 - For lowest / worst queries (e.g. "lowest sales"), set 'sort_direction': "ascending".
 - For average queries (e.g. "average sales by state"), use 'mean' on the numeric metric column.
 - For multi-step queries (e.g. "highest sales for age > 25"), sequence steps logically (filter_data first, then group_data/aggregate_data).

@@ -513,3 +513,76 @@ def compare_datasets(
         "comparison_details": comparison_details,
         "warnings": warnings,
     }
+
+
+def compare_dataset_metrics(
+    dataset_ids: List[str],
+    metric_column: str,
+    aggregation: str = "sum",
+) -> Dict[str, Any]:
+    """Computes exact quantitative metric values and deltas across 2 or more registered datasets.
+
+    Returns structured dictionary with DatasetMetricDelta items.
+    """
+    if not dataset_ids or len(dataset_ids) < 2:
+        raise MultiDatasetError("At least 2 dataset IDs must be provided for metric comparison.")
+
+    resolved_dfs = []
+    warnings = []
+    for ds_id in dataset_ids:
+        try:
+            df = _resolve_dataframe(ds_id, None)
+            resolved_dfs.append((ds_id, df))
+        except Exception as e:
+            raise MultiDatasetError(f"Failed to resolve dataset '{ds_id}': {str(e)}") from e
+
+    metric_vals = {}
+    for ds_id, df in resolved_dfs:
+        matching_col = next((c for c in df.columns if c.lower() == metric_column.lower()), None)
+        if not matching_col:
+            if metric_column.lower() in ("order id", "order_id", "count", "orders"):
+                matching_col = next((c for c in df.columns if "order" in c.lower() or "id" in c.lower()), df.columns[0])
+            else:
+                warnings.append(f"Metric column '{metric_column}' not found in dataset '{ds_id}'. Using default.")
+                matching_col = df.columns[0]
+
+        series = df[matching_col].dropna()
+        if aggregation == "sum":
+            val = float(pd.to_numeric(series, errors="coerce").sum())
+        elif aggregation == "mean":
+            val = float(pd.to_numeric(series, errors="coerce").mean())
+        elif aggregation == "count":
+            val = float(len(series))
+        else:
+            val = float(len(series))
+
+        metric_vals[ds_id] = (matching_col, round(val, 2))
+
+    base_id = dataset_ids[0]
+    base_col, base_val = metric_vals[base_id]
+
+    deltas = []
+    for comp_id in dataset_ids[1:]:
+        comp_col, comp_val = metric_vals[comp_id]
+        abs_delta = round(comp_val - base_val, 2)
+        pct_delta = round(((comp_val - base_val) / abs(base_val)) * 100.0, 2) if base_val != 0 else None
+
+        deltas.append({
+            "metric_column": metric_column,
+            "dataset_1_id": base_id,
+            "dataset_2_id": comp_id,
+            "dataset_1_value": base_val,
+            "dataset_2_value": comp_val,
+            "absolute_delta": abs_delta,
+            "percentage_delta": pct_delta,
+            "aggregation": aggregation,
+        })
+
+    return {
+        "dataset_ids": dataset_ids,
+        "metric_column": metric_column,
+        "deltas": deltas,
+        "execution_status": "success",
+        "warnings": warnings,
+    }
+

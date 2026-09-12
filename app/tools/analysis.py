@@ -119,14 +119,16 @@ def group_data(
     sort_by: Optional[str] = None,
     sort_direction: Optional[str] = None,
     limit: Optional[int] = None,
+    time_grain: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Groups DataFrame by specified columns and applies aggregation functions.
 
-    group_by: ["Region", "Category"]
+    group_by: ["Region", "Category"] or ["Order Date"]
     aggregations: {"Revenue": ["sum", "mean"], "Units": ["sum"]}
     sort_by: Column name to sort by (e.g., "Revenue_sum" or "Sales")
     sort_direction: "ascending" or "descending"
     limit: Top-N integer row limit
+    time_grain: "day" | "week" | "month" | "quarter" | "year"
     """
     target_df = _resolve_dataframe(dataset_id, df)
 
@@ -137,24 +139,64 @@ def group_data(
         if col not in target_df.columns:
             raise AnalysisToolError(f"Group column '{col}' not found in dataset.")
 
+    working_df = target_df.copy()
+    input_rows = len(target_df)
+    valid_datetime_rows = input_rows
+    excluded_datetime_rows = 0
+
+    # Temporal Bucketing & Null Date Handling if time_grain is specified
+    if time_grain:
+        date_col = group_by[0]
+        parsed_dates = pd.to_datetime(working_df[date_col], format="mixed", dayfirst=True, errors="coerce")
+        valid_mask = parsed_dates.notnull()
+        valid_datetime_rows = int(valid_mask.sum())
+        excluded_datetime_rows = input_rows - valid_datetime_rows
+
+        if valid_datetime_rows == 0:
+            raise AnalysisToolError(f"Date column '{date_col}' contains no valid parseable dates for time grain '{time_grain}'.")
+
+        # Exclude null/unparseable date rows from temporal grouping
+        working_df = working_df[valid_mask].copy()
+        valid_dates = parsed_dates[valid_mask]
+
+        grain_lower = str(time_grain).lower()
+        if grain_lower == "day":
+            working_df[date_col] = valid_dates.dt.strftime("%Y-%m-%d")
+        elif grain_lower == "week":
+            working_df[date_col] = valid_dates.apply(lambda d: f"{d.isocalendar().year}-W{d.isocalendar().week:02d}")
+        elif grain_lower in ("month", "year_month"):
+            working_df[date_col] = valid_dates.dt.strftime("%Y-%m")
+        elif grain_lower == "quarter":
+            working_df[date_col] = valid_dates.apply(lambda d: f"{d.year}-Q{(d.month - 1) // 3 + 1}")
+        elif grain_lower == "year":
+            working_df[date_col] = valid_dates.dt.strftime("%Y")
+
     if not aggregations:
         # Default count aggregation
-        grouped_df = target_df.groupby(group_by, as_index=False).size().rename(columns={"size": "count"})
+        grouped_df = working_df.groupby(group_by, as_index=False).size().rename(columns={"size": "count"})
     else:
+        # Normalize count_distinct to nunique for pandas compatibility
+        normalized_aggs = {}
         for col, funcs in aggregations.items():
-            if col not in target_df.columns:
+            if col not in working_df.columns:
                 raise AnalysisToolError(f"Aggregation column '{col}' not found in dataset.")
-            col_dtype = target_df[col].dtype
+            col_dtype = working_df[col].dtype
             is_numeric = pd.api.types.is_numeric_dtype(col_dtype)
+            norm_funcs = []
             for func in funcs:
                 func_lower = str(func).lower()
                 if func_lower in NUMERIC_ONLY_AGGS and not is_numeric:
                     raise AnalysisToolError(
                         f"Invalid aggregation '{func}' for non-numeric column '{col}' (dtype: {col_dtype})."
                     )
+                if func_lower == "count_distinct":
+                    norm_funcs.append("nunique")
+                else:
+                    norm_funcs.append(func)
+            normalized_aggs[col] = norm_funcs
 
         try:
-            grouped_df = target_df.groupby(group_by, as_index=False).agg(aggregations)
+            grouped_df = working_df.groupby(group_by, as_index=False).agg(normalized_aggs)
         except Exception as e:
             raise AnalysisToolError(f"Aggregation failed on dataset: {str(e)}")
 
@@ -168,11 +210,10 @@ def group_data(
                     new_cols.append(str(col_pair[0]))
             grouped_df.columns = new_cols
 
-    # Explicit sorting if specified
+    # Explicit sorting if specified, else default to chronological sort for time_grain
     if sort_by:
         target_sort_col = sort_by
         if target_sort_col not in grouped_df.columns:
-            # Match partial col name if flattened (e.g. Sales -> Sales_sum)
             matched = [c for c in grouped_df.columns if c.startswith(target_sort_col)]
             if matched:
                 target_sort_col = matched[0]
@@ -184,6 +225,12 @@ def group_data(
             raise AnalysisToolError(
                 f"Sort column '{sort_by}' not found in grouped results. Available columns: {list(grouped_df.columns)}"
             )
+    elif time_grain and group_by:
+        # Default to chronological sorting on period column
+        date_sort_col = group_by[0]
+        if date_sort_col in grouped_df.columns:
+            is_asc = (sort_direction or "ascending").lower() in ["ascending", "asc"]
+            grouped_df = grouped_df.sort_values(by=date_sort_col, ascending=is_asc)
 
     # Optional top-N limit
     if limit is not None and limit > 0:
@@ -194,9 +241,22 @@ def group_data(
     for _, row in grouped_df.head(head_rows).iterrows():
         records.append({str(k): sanitize_for_json(v) for k, v in row.items()})
 
+    exec_metadata = {
+        "input_rows": input_rows,
+        "valid_datetime_rows": valid_datetime_rows,
+        "excluded_datetime_rows": excluded_datetime_rows,
+        "groups_generated": len(grouped_df),
+    }
+
     return {
         "group_by": group_by,
+        "time_grain": time_grain,
         "result_row_count": len(grouped_df),
+        "groups_generated": len(grouped_df),
+        "input_rows": input_rows,
+        "valid_datetime_rows": valid_datetime_rows,
+        "excluded_datetime_rows": excluded_datetime_rows,
+        "execution_metadata": exec_metadata,
         "columns": list(grouped_df.columns),
         "rows": records,
         "sort_by": sort_by,
@@ -226,8 +286,10 @@ def aggregate_data(
                 col_res["sum"] = sanitize_for_json(series.sum())
             elif func == "mean":
                 col_res["mean"] = sanitize_for_json(series.mean())
-            elif func == "count":
+            elif func in ("count", "count_non_null"):
                 col_res["count"] = int(series.count())
+            elif func in ("nunique", "count_distinct"):
+                col_res[func] = int(series.nunique())
             elif func == "min":
                 col_res["min"] = sanitize_for_json(series.min())
             elif func == "max":

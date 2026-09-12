@@ -247,3 +247,84 @@ def test_api_join_invalid_request():
     """Test POST /api/v1/analyze/join returns HTTP 400 for less than 2 dataset IDs."""
     res = client.post("/api/v1/analyze/join", json={"dataset_ids": ["ds_1"]})
     assert res.status_code == 422 or res.status_code == 400
+
+
+def test_phase19_compare_dataset_metrics():
+    """Phase 19: Verifies compare_dataset_metrics computes exact deltas and percentage shifts."""
+    from app.tools.multi_dataset import compare_dataset_metrics
+
+    # Create 2 uploaded datasets
+    csv1 = "Order ID,Revenue\nO1,100.0\nO2,200.0\n"
+    csv2 = "Order ID,Revenue\nO3,150.0\nO4,250.0\n"
+
+    f1 = ("q1.csv", io.BytesIO(csv1.encode("utf-8")), "text/csv")
+    f2 = ("q2.csv", io.BytesIO(csv2.encode("utf-8")), "text/csv")
+
+    up1 = client.post("/api/v1/upload", files={"file": f1})
+    up2 = client.post("/api/v1/upload", files={"file": f2})
+
+    id1 = up1.json()["dataset"]["id"]
+    id2 = up2.json()["dataset"]["id"]
+
+    try:
+        res = compare_dataset_metrics(dataset_ids=[id1, id2], metric_column="Revenue", aggregation="sum")
+        assert res["execution_status"] == "success"
+        deltas = res["deltas"]
+        assert len(deltas) == 1
+        d = deltas[0]
+        assert d["dataset_1_value"] == 300.0
+        assert d["dataset_2_value"] == 400.0
+        assert d["absolute_delta"] == 100.0
+        assert d["percentage_delta"] == 33.33
+    finally:
+        client.delete(f"/api/v1/datasets/{id1}")
+        client.delete(f"/api/v1/datasets/{id2}")
+
+
+def test_phase19_multi_dataset_edge_cases():
+    """Phase 19: Tests multi-dataset edge cases: invalid dataset ID, missing metric column, single dataset isolation."""
+    from app.tools.multi_dataset import compare_dataset_metrics, MultiDatasetError
+
+    # 1. Invalid dataset ID raises MultiDatasetError
+    with pytest.raises(MultiDatasetError, match="Failed to resolve dataset"):
+        compare_dataset_metrics(dataset_ids=["invalid_id_1", "invalid_id_2"], metric_column="Sales")
+
+    # 2. Upload 2 datasets: 1 with Revenue, 1 without Revenue (missing metric column)
+    csv1 = "Order ID,Revenue\nO1,100.0\nO2,200.0\n"
+    csv2 = "Order ID,Sales\nO3,150.0\nO4,250.0\n"
+
+    up1 = client.post("/api/v1/upload", files={"file": ("d1.csv", io.BytesIO(csv1.encode("utf-8")), "text/csv")})
+    up2 = client.post("/api/v1/upload", files={"file": ("d2.csv", io.BytesIO(csv2.encode("utf-8")), "text/csv")})
+
+    id1 = up1.json()["dataset"]["id"]
+    id2 = up2.json()["dataset"]["id"]
+
+    try:
+        res = compare_dataset_metrics(dataset_ids=[id1, id2], metric_column="Revenue", aggregation="sum")
+        assert res["execution_status"] == "success"
+        assert len(res["warnings"]) >= 1
+        assert "not found in dataset" in res["warnings"][0]
+        assert len(res["deltas"]) == 1
+    finally:
+        client.delete(f"/api/v1/datasets/{id1}")
+        client.delete(f"/api/v1/datasets/{id2}")
+
+
+def test_phase19_single_dataset_query_isolation():
+    """Phase 19: Verifies single-dataset queries do NOT enter comparison mode."""
+    csv1 = "Order ID,Sales\nO1,100.0\nO2,200.0\n"
+    up1 = client.post("/api/v1/upload", files={"file": ("single.csv", io.BytesIO(csv1.encode("utf-8")), "text/csv")})
+    id1 = up1.json()["dataset"]["id"]
+
+    try:
+        res = client.post("/api/v1/query", json={"query": "What are total sales?", "dataset_id": id1})
+        assert res.status_code == 200
+        data = res.json()
+        assert data["analyst"]["execution_status"] == "success"
+        # Must not have multi_dataset comparison in tool calls executed
+        tools = [call["tool"] for call in data["analyst"]["tool_calls_executed"]]
+        assert "compare_datasets" not in tools
+    finally:
+        client.delete(f"/api/v1/datasets/{id1}")
+
+

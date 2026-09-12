@@ -352,8 +352,38 @@ export const AgentWorkspace: React.FC = () => {
                             </ul>
                           </div>
                         )}
+
+                        {/* Suggested Follow-ups */}
+                        {Array.isArray(resp.insight.suggested_followups) && resp.insight.suggested_followups.length > 0 && (
+                          <div style={{ marginTop: '0.75rem', paddingTop: '0.5rem', borderTop: '1px solid rgba(255, 255, 255, 0.1)' }}>
+                            <strong style={{ fontSize: '0.8rem', color: 'var(--accent-cyan)', display: 'block', marginBottom: '0.35rem' }}>Suggested Follow-ups:</strong>
+                            <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                              {resp.insight.suggested_followups.map((sug, idx) => (
+                                <button
+                                  key={idx}
+                                  type="button"
+                                  onClick={() => handlePromptClick(sug)}
+                                  disabled={loading}
+                                  style={{
+                                    padding: '0.3rem 0.65rem',
+                                    borderRadius: 'var(--radius-full)',
+                                    backgroundColor: 'rgba(56, 189, 248, 0.12)',
+                                    border: '1px solid rgba(56, 189, 248, 0.3)',
+                                    color: 'var(--accent-cyan)',
+                                    fontSize: '0.75rem',
+                                    cursor: 'pointer',
+                                    transition: 'all var(--transition-fast)',
+                                  }}
+                                >
+                                  <Sparkles size={10} style={{ display: 'inline', marginRight: '3px' }} /> {sug}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                       </div>
                     )}
+
                   </div>
                 </div>
               </div>

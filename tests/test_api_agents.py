@@ -176,3 +176,172 @@ def test_api_query_empty_query():
     response = client.post("/api/v1/query", json=payload)
     assert response.status_code == 400
     assert "empty" in response.json()["detail"].lower()
+
+
+def test_api_query_list_of_orders_production_endpoint():
+    """11. Mandatory production endpoint test for List of Orders CSV via POST /api/v1/query."""
+    csv_content = (
+        "Order ID,Order Date,CustomerName,State,City\n"
+        "B-25601,25-01-2019,Bharat,Maharashtra,Mumbai\n"
+        "B-25602,26-01-2019,Pearl,Madhya Pradesh,Bhopal\n"
+        "B-25603,27-01-2019,Jash,Madhya Pradesh,Indore\n"
+        "B-25604,28-01-2019,Divya,Maharashtra,Pune\n"
+        "B-25605,29-01-2019,Khitish,Madhya Pradesh,Gwalior\n"
+    )
+    file = ("List of Orders.csv", io.BytesIO(csv_content.encode("utf-8")), "text/csv")
+    upload_res = client.post("/api/v1/upload", files={"file": file})
+    assert upload_res.status_code == 201
+    dataset_id = upload_res.json()["dataset"]["id"]
+
+    try:
+        payload = {
+            "query": "Which states have the highest number of orders?",
+            "dataset_id": dataset_id,
+        }
+        res = client.post("/api/v1/query", json=payload)
+        assert res.status_code == 200
+        data = res.json()
+
+        assert data["analyst"] is not None
+        assert data["analyst"]["execution_status"] == "success"
+
+        # 1. State is grouping dimension & Order ID is count entity & DESC sorting
+        executed_calls = data["analyst"]["tool_calls_executed"]
+        assert len(executed_calls) >= 1
+        group_call = executed_calls[0]
+        assert group_call["tool"] == "group_data"
+        assert group_call["params"]["group_by"] == ["State"]
+        assert group_call["params"]["aggregations"] == {"Order ID": ["count"]}
+        assert group_call["params"]["sort_direction"] == "descending"
+
+        # 2. Result contains state-level groups (not a single dataset-wide count)
+        quant = data["analyst"]["quantitative_results"]["step_1_group_data"]
+        assert quant["result_row_count"] > 1
+        assert quant["rows"][0]["State"] == "Madhya Pradesh"
+        assert quant["rows"][0]["Order ID_count"] == 3
+        assert quant["rows"][1]["State"] == "Maharashtra"
+        assert quant["rows"][1]["Order ID_count"] == 2
+
+        # 3. No Month / Target substitution
+        for col in quant["columns"]:
+            assert "Month" not in col
+            assert "Target" not in col
+
+        # 4. Insight executive summary contains state-level ranking and no Chi-Square primary answer
+        insight = data["insight"]
+        assert insight is not None
+        assert "Madhya Pradesh" in insight["executive_summary"]
+        for k in insight.get("key_insights", []):
+            assert "Chi-Square test of independence reveals a statistically significant association between 'State' and 'City'" not in k
+    finally:
+        client.delete(f"/api/v1/datasets/{dataset_id}")
+
+
+def test_api_temporal_grouping_orders_each_month():
+    """Mandatory REST API endpoint test for temporal query 'How many orders were placed each month?'."""
+    csv_content = (
+        "Order ID,Order Date,CustomerName,State,City\n"
+        "B-25601,25-04-2018,Bharat,Maharashtra,Mumbai\n"
+        "B-25602,26-04-2018,Pearl,Madhya Pradesh,Bhopal\n"
+        "B-25603,27-05-2018,Jash,Madhya Pradesh,Indore\n"
+        "B-25604,28-05-2018,Divya,Maharashtra,Pune\n"
+        "B-25605,29-06-2018,Khitish,Madhya Pradesh,Gwalior\n"
+    )
+    file = ("List of Orders.csv", io.BytesIO(csv_content.encode("utf-8")), "text/csv")
+    upload_res = client.post("/api/v1/upload", files={"file": file})
+    assert upload_res.status_code == 201
+    dataset_id = upload_res.json()["dataset"]["id"]
+
+    try:
+        payload = {
+            "query": "How many orders were placed each month?",
+            "dataset_id": dataset_id,
+        }
+        res = client.post("/api/v1/query", json=payload)
+        assert res.status_code == 200
+        data = res.json()
+
+        assert data["analyst"] is not None
+        assert data["analyst"]["execution_status"] == "success"
+
+        # Assertions:
+        # - temporal dimension = Order Date
+        # - time_grain = month
+        # - metric = Order ID
+        # - aggregation = count
+        executed_calls = data["analyst"]["tool_calls_executed"]
+        assert len(executed_calls) >= 1
+        group_call = executed_calls[0]
+        assert group_call["tool"] == "group_data"
+        assert group_call["params"]["group_by"] == ["Order Date"]
+        assert group_call["params"]["time_grain"] == "month"
+        assert group_call["params"]["aggregations"] == {"Order ID": ["count"]}
+
+        # - multiple month groups
+        # - chronological ordering
+        # - no dataset-wide-only count
+        quant = data["analyst"]["quantitative_results"]["step_1_group_data"]
+        assert quant["result_row_count"] == 3
+        dates = [r["Order Date"] for r in quant["rows"]]
+        assert dates == ["2018-04", "2018-05", "2018-06"]
+        assert quant["rows"][0]["Order ID_count"] == 2
+        assert quant["rows"][1]["Order ID_count"] == 2
+        assert quant["rows"][2]["Order ID_count"] == 1
+
+        assert "Ranked by 'Order Date' (lowest)" not in data["analyst"]["findings_summary"]
+
+        # - no State/City hypothesis replacing the answer
+        insight = data["insight"]
+        assert insight is not None
+        assert "2018-04: 2" in insight["executive_summary"] or "Monthly Breakdown" in str(insight["key_insights"])
+        for k in insight.get("key_insights", []):
+            assert "Chi-Square test of independence reveals a statistically significant association between 'State' and 'City'" not in k
+    finally:
+        client.delete(f"/api/v1/datasets/{dataset_id}")
+
+
+def test_api_exploratory_query_endpoint():
+    """Verifies REST API endpoint POST /api/v1/query returns deterministic exploratory finding for open-ended queries."""
+    csv_content = (
+        "Order ID,Order Date,State,Category,Sales\n"
+        "O1,2019-01-05,Madhya Pradesh,Electronics,500.0\n"
+        "O2,2019-01-10,Madhya Pradesh,Electronics,800.0\n"
+        "O3,2019-01-15,Madhya Pradesh,Electronics,700.0\n"
+        "O4,2019-02-05,Maharashtra,Clothing,200.0\n"
+        "O5,2019-02-10,Maharashtra,Clothing,100.0\n"
+    )
+    file = ("exploratory_test.csv", io.BytesIO(csv_content.encode("utf-8")), "text/csv")
+    upload_res = client.post("/api/v1/upload", files={"file": file})
+    assert upload_res.status_code == 201
+    dataset_id = upload_res.json()["dataset"]["id"]
+
+    try:
+        payload = {
+            "query": "Tell me something interesting about the orders.",
+            "dataset_id": dataset_id,
+        }
+        res = client.post("/api/v1/query", json=payload)
+        assert res.status_code == 200
+        data = res.json()
+
+        assert data["analyst"] is not None
+        assert data["analyst"]["execution_status"] == "success"
+
+        # Check executed tool calls
+        executed_calls = data["analyst"]["tool_calls_executed"]
+        assert len(executed_calls) >= 1
+        assert executed_calls[0]["tool"] == "group_data"
+
+        # Check findings summary is NOT merely "Aggregations: 'Order ID': count=500"
+        summary = data["analyst"]["findings_summary"]
+        assert "Aggregations: 'Order ID': count=500" not in summary
+
+        # Check insight output
+        insight = data["insight"]
+        assert insight is not None
+        assert insight["confidence_score"] > 0.50
+    finally:
+        client.delete(f"/api/v1/datasets/{dataset_id}")
+
+
+

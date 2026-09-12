@@ -49,10 +49,230 @@ class DataAnalystAgentError(Exception):
 from app.data.metadata import is_identifier_column
 
 
+def resolve_datetime_column(target_df: pd.DataFrame) -> Tuple[Optional[str], float]:
+    """Resolves temporal date column with robust validation priority.
+
+    Priority:
+    1. Existing pandas datetime dtype (100% valid)
+    2. Safely parseable string/object date column with >50% valid parse rate
+    Returns (column_name, parse_rate) or (None, 0.0).
+    """
+    cols = list(target_df.columns)
+
+    # Priority A: Native datetime dtype
+    for c in cols:
+        if pd.api.types.is_datetime64_any_dtype(target_df[c]):
+            return c, 1.0
+
+    # Priority B & C: Parseable date column with >50% parse success rate
+    best_cand = None
+    best_rate = 0.0
+
+    for c in cols:
+        series = target_df[c].dropna()
+        if series.empty or pd.api.types.is_numeric_dtype(series.dtype):
+            continue
+
+        cl = c.lower()
+        has_date_name = any(kw in cl for kw in ["date", "time", "month", "year", "quarter", "day"])
+
+        # Test parse rate safely on series without mutating original dataframe
+        parsed = pd.to_datetime(series, format="mixed", dayfirst=True, errors="coerce")
+        valid_cnt = parsed.notnull().sum()
+        total_cnt = len(series)
+        rate = float(valid_cnt / total_cnt) if total_cnt > 0 else 0.0
+
+        if rate > 0.50:
+            if has_date_name:
+                return c, rate  # Priority C supporting evidence + parse rate > 50%
+            if rate > best_rate:
+                best_cand = c
+                best_rate = rate
+
+    if best_cand and best_rate > 0.50:
+        return best_cand, best_rate
+
+    return None, 0.0
+
+
+def select_best_exploratory_candidate(df: pd.DataFrame) -> Tuple[Optional[AnalysisPlanStep], float, str]:
+    """Dynamically scans dataset for the strongest analytical candidate.
+    
+    Returns (plan_step, candidate_score, summary_finding).
+    Does NOT hardcode column names. Evaluates all valid non-identifier columns.
+    """
+    from app.data.metadata import is_identifier_column
+
+    if df.empty or len(df) < 2:
+        return None, 0.0, "No strong empirical pattern was found in the available data."
+
+    candidates = []
+    cols = list(df.columns)
+    non_id_cols = [c for c in cols if not is_identifier_column(c, df[c]) and df[c].nunique() > 1]
+
+    num_cols = [c for c in non_id_cols if pd.api.types.is_numeric_dtype(df[c].dtype)]
+    cat_cols = [c for c in non_id_cols if not pd.api.types.is_numeric_dtype(df[c].dtype)]
+
+    # 1. Temporal Peak Candidate Scan (if datetime column exists)
+    dt_col, dt_rate = resolve_datetime_column(df)
+    if dt_col and dt_rate > 0.50:
+        order_id_col = next((c for c in cols if "order" in c.lower() and "id" in c.lower()), None)
+        agg_col = order_id_col or (num_cols[0] if num_cols else cols[0])
+        agg_func = "count" if (agg_col in cols and not pd.api.types.is_numeric_dtype(df[agg_col].dtype)) else ("sum" if num_cols else "count")
+
+        try:
+            parsed = pd.to_datetime(df[dt_col].dropna(), format="mixed", dayfirst=True, errors="coerce")
+            valid = parsed.dropna()
+            if len(valid) >= 5:
+                months = valid.dt.strftime("%Y-%m")
+                counts = months.value_counts()
+                if len(counts) >= 2:
+                    top_period = counts.index[0]
+                    top_val = int(counts.iloc[0])
+                    total_orders = int(counts.sum())
+                    avg_vol = total_orders / len(counts)
+                    surge_ratio = top_val / avg_vol if avg_vol > 0 else 1.0
+
+                    if surge_ratio >= 1.25:
+                        score = min(0.95, 0.50 + (surge_ratio - 1.0) * 0.30)
+                    else:
+                        score = 0.20 + (surge_ratio - 1.0) * 0.20
+
+                    pct_above_avg = round(((top_val - avg_vol) / avg_vol) * 100.0, 1) if avg_vol > 0 else 0.0
+                    cand_step = AnalysisPlanStep(
+                        tool_name="group_data",
+                        params={
+                            "group_by": [dt_col],
+                            "aggregations": {agg_col: [agg_func]},
+                            "sort_by": f"{agg_col}_{agg_func}",
+                            "sort_direction": "descending",
+                            "limit": 1,
+                            "time_grain": "month",
+                        },
+                        purpose=f"Find peak month for {agg_col} over {dt_col}"
+                    )
+                    finding = f"Peak monthly volume occurred in '{top_period}' with {top_val} recorded entries ({pct_above_avg}% above monthly average)."
+                    candidates.append((score, cand_step, finding))
+        except Exception:
+            pass
+
+    # 2. Categorical Frequency / Concentration Candidate Scan
+    for c_cat in cat_cols:
+        card = df[c_cat].nunique()
+        if 2 <= card <= 50 and len(df[c_cat].dropna()) >= 5:
+            counts = df[c_cat].value_counts()
+            top_cat = counts.index[0]
+            top_val = int(counts.iloc[0])
+            total_val = len(df[c_cat].dropna())
+            share_pct = round((top_val / total_val) * 100.0, 1)
+            expected_uniform_share = 100.0 / card
+            concentration_ratio = share_pct / expected_uniform_share if expected_uniform_share > 0 else 1.0
+
+            if concentration_ratio >= 1.25 and share_pct >= 25.0:
+                score = min(0.90, 0.45 + (concentration_ratio - 1.0) * 0.30)
+            else:
+                score = 0.20 + (share_pct / 100.0) * 0.20
+
+            # Select distinct count column (never the grouping column itself)
+            count_col = next((c for c in cols if c != c_cat and not is_identifier_column(c, df[c])), None)
+            if not count_col:
+                count_col = next((c for c in cols if c != c_cat), cols[0])
+
+            agg_func = "count"
+
+            cand_step = AnalysisPlanStep(
+                tool_name="group_data",
+                params={
+                    "group_by": [c_cat],
+                    "aggregations": {count_col: [agg_func]},
+                    "sort_by": f"{count_col}_{agg_func}",
+                    "sort_direction": "descending",
+                    "limit": 5,
+                },
+                purpose=f"Find top category distribution for {c_cat}"
+            )
+            second_str = f", followed by '{counts.index[1]}' ({counts.iloc[1]})" if len(counts) > 1 else ""
+            finding = f"Top segment in '{c_cat}' is '{top_cat}' with {top_val} entries ({share_pct}% share){second_str}."
+            candidates.append((score, cand_step, finding))
+
+    # 3. Numeric Sum / Concentration Candidate Scan
+    for c_num in num_cols:
+        for c_cat in cat_cols:
+            if df[c_cat].nunique() >= 2 and len(df) >= 5:
+                grouped = df.groupby(c_cat)[c_num].sum().sort_values(ascending=False)
+                tot = grouped.sum()
+                if tot > 0 and (df[c_num] >= 0).all():
+                    top_cat = grouped.index[0]
+                    top_val = float(grouped.iloc[0])
+                    share_pct = round((top_val / tot) * 100.0, 1)
+                    card = len(grouped)
+                    expected_uniform_share = 100.0 / card
+                    concentration_ratio = share_pct / expected_uniform_share if expected_uniform_share > 0 else 1.0
+
+                    if concentration_ratio >= 1.25 and share_pct >= 25.0:
+                        score = min(0.92, 0.50 + (concentration_ratio - 1.0) * 0.35)
+                    else:
+                        score = 0.20 + (share_pct / 100.0) * 0.20
+
+                    cand_step = AnalysisPlanStep(
+                        tool_name="group_data",
+                        params={
+                            "group_by": [c_cat],
+                            "aggregations": {c_num: ["sum"]},
+                            "sort_by": f"{c_num}_sum",
+                            "sort_direction": "descending",
+                            "limit": 5,
+                        },
+                        purpose=f"Group by {c_cat} and calculate sum for {c_num}"
+                    )
+                    finding = f"Segment '{top_cat}' in '{c_cat}' leads total '{c_num}' with {top_val:,.1f} ({share_pct}% share)."
+                    candidates.append((score, cand_step, finding))
+
+    # 4. Numeric Anomaly / Outlier Candidate Scan (for numeric columns with Z-score >= 3.0)
+    for c_num in num_cols:
+        s_clean = pd.to_numeric(df[c_num], errors="coerce").dropna()
+        if len(s_clean) >= 5:
+            mean_val = s_clean.mean()
+            std_val = s_clean.std()
+            if std_val > 0:
+                z_scores = ((s_clean - mean_val) / std_val).abs()
+                max_z = float(z_scores.max())
+                if max_z >= 3.0:
+                    score = min(0.95, 0.55 + (max_z - 3.0) * 0.10)
+                    outlier_val = float(s_clean[z_scores == max_z].iloc[0])
+                    cand_step = AnalysisPlanStep(
+                        tool_name="detect_anomalies",
+                        params={
+                            "column": c_num,
+                            "method": "zscore",
+                            "threshold": 3.0,
+                        },
+                        purpose=f"Detect statistical anomalies in column {c_num}"
+                    )
+                    finding = f"Statistical anomaly detected in '{c_num}' with outlier value {outlier_val:,.1f} (Z-score: {max_z:.2f})."
+                    candidates.append((score, cand_step, finding))
+
+    if not candidates:
+        return None, 0.30, "No strong empirical pattern was found in the available data."
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_step, best_finding = candidates[0]
+    return best_step, best_score, best_finding
+
+
+
 def resolve_query_intent(query: str, target_df: pd.DataFrame) -> Dict[str, Any]:
-    """Deterministically resolves query intent to dimension, metric, aggregation, sort_direction, limit."""
+    """Deterministically resolves query intent to dimension, metric, aggregation, sort_direction, limit, time_grain, is_exploratory."""
     q_lower = query.lower().strip()
     cols = list(target_df.columns)
+
+    # Check for explicit exploratory request
+    exploratory_phrases = [
+        "something interesting", "interesting", "stands out", "interesting insight",
+        "interesting insights", "what should i know", "discover insight", "discover insights",
+        "tell me about", "key findings", "explore", "find something"
+    ]
+    is_exploratory = any(phrase in q_lower for phrase in exploratory_phrases)
 
     # 1. Check for explicit identifier request in query
     explicit_id_keywords = ["order id", "customer id", "product id", "transaction id", "invoice id", "by order", "by customer", "sku"]
@@ -64,32 +284,54 @@ def resolve_query_intent(query: str, target_df: pd.DataFrame) -> Dict[str, Any]:
 
     resolved_dim = None
     requested_dim_term = None
+    time_grain = None
 
-    dim_concepts = {
-        "state": ["state", "states", "province", "provinces", "region", "regions"],
-        "city": ["city", "cities", "town", "towns", "location", "locations"],
-        "category": ["category", "categories", "department", "departments"],
-        "subcategory": ["sub-category", "subcategory", "sub-categories", "subcategories", "sub category", "sub categories"],
-        "customer": ["customer", "customers", "client", "clients", "buyer", "buyers"],
-        "product": ["product", "products", "item", "items", "goods"],
-        "segment": ["segment", "segments", "tier", "tiers"],
-        "country": ["country", "countries", "nation", "nations"],
+    # Temporal Grain & Phrase Resolution
+    temporal_phrases = {
+        "month": ["each month", "by month", "monthly", "per month", "every month", "which month", "month by month"],
+        "year": ["each year", "by year", "yearly", "annually", "per year", "every year", "which year"],
+        "quarter": ["each quarter", "by quarter", "quarterly", "per quarter", "which quarter"],
+        "week": ["each week", "by week", "weekly", "per week", "which week"],
+        "day": ["each day", "by day", "daily", "per day", "which day"],
     }
 
-    for concept, keywords in dim_concepts.items():
-        matched_kw = next((kw for kw in keywords if kw in q_lower), None)
-        if matched_kw:
-            requested_dim_term = matched_kw
-            for c in cat_cols:
-                cl = c.lower()
-                if concept in cl or matched_kw in cl or cl in keywords:
-                    resolved_dim = c
+    for grain, phrases in temporal_phrases.items():
+        matched_phrase = next((p for p in phrases if p in q_lower), None)
+        if matched_phrase:
+            time_grain = grain
+            requested_dim_term = matched_phrase
+            break
+
+    dt_col, dt_rate = resolve_datetime_column(target_df)
+    if time_grain and dt_col:
+        resolved_dim = dt_col
+
+    if not resolved_dim:
+        dim_concepts = {
+            "state": ["state", "states", "province", "provinces", "region", "regions"],
+            "city": ["city", "cities", "town", "towns", "location", "locations"],
+            "category": ["category", "categories", "department", "departments"],
+            "subcategory": ["sub-category", "subcategory", "sub-categories", "subcategories", "sub category", "sub categories"],
+            "customer": ["customer", "customers", "client", "clients", "buyer", "buyers"],
+            "product": ["product", "products", "item", "items", "goods"],
+            "segment": ["segment", "segments", "tier", "tiers"],
+            "country": ["country", "countries", "nation", "nations"],
+        }
+
+        for concept, keywords in dim_concepts.items():
+            matched_kw = next((kw for kw in keywords if kw in q_lower), None)
+            if matched_kw:
+                requested_dim_term = matched_kw
+                for c in cat_cols:
+                    cl = c.lower()
+                    if concept in cl or matched_kw in cl or cl in keywords:
+                        resolved_dim = c
+                        break
+                    if concept == "subcategory" and ("sub" in cl or "cat" in cl):
+                        resolved_dim = c
+                        break
+                if resolved_dim:
                     break
-                if concept == "subcategory" and ("sub" in cl or "cat" in cl):
-                    resolved_dim = c
-                    break
-            if resolved_dim:
-                break
 
     if not resolved_dim:
         for c in cat_cols:
@@ -98,45 +340,110 @@ def resolve_query_intent(query: str, target_df: pd.DataFrame) -> Dict[str, Any]:
                 resolved_dim = c
                 break
 
-    # 2. Metric Resolution
+    # 2. Metric & Count Intent Resolution
     resolved_metric = None
-    metric_keywords = ["sales", "amount", "revenue", "profit", "quantity", "units", "spend", "turnover"]
-    mentioned_metric_kw = next((kw for kw in metric_keywords if kw in q_lower), None)
+    agg = "sum"
 
-    if mentioned_metric_kw:
-        exact_col = next((c for c in num_cols if c.lower() == mentioned_metric_kw), None)
-        if exact_col:
-            resolved_metric = exact_col
+    # Check if query is an order count / entity count query
+    order_count_terms = ["order", "orders", "number of orders", "order count", "most orders", "highest number of orders", "fewest orders", "lowest number of orders", "top states by orders"]
+    has_explicit_count_request = any(kw in q_lower for kw in ["how many", "number of", "count of", "total count", "which state", "which month", "highest orders", "lowest orders"])
+    
+    is_order_count_query = (not is_exploratory or has_explicit_count_request) and (
+        any(term in q_lower for term in order_count_terms) or (
+            ("order" in q_lower or "orders" in q_lower) and any(w in q_lower for w in ["number", "count", "most", "highest", "fewest", "lowest", "top", "bottom", "each", "by", "per"])
+        )
+    )
+
+    if is_order_count_query:
+        # Priority for Order ID Resolution:
+        # 1. Exact case-insensitive 'Order ID'
+        exact_order_id = next((c for c in cols if c.lower() == "order id"), None)
+        if exact_order_id:
+            resolved_metric = exact_order_id
         else:
-            if mentioned_metric_kw in ("sales", "total sales"):
-                resolved_metric = next((c for c in num_cols if c.lower() in ("sales", "amount", "revenue")), None)
-            elif mentioned_metric_kw == "revenue":
-                resolved_metric = next((c for c in num_cols if c.lower() in ("revenue", "sales", "amount")), None)
-            elif mentioned_metric_kw == "amount":
-                resolved_metric = next((c for c in num_cols if c.lower() in ("amount", "sales", "revenue")), None)
-            elif mentioned_metric_kw == "profit":
-                resolved_metric = next((c for c in num_cols if c.lower() in ("profit", "net_profit", "earnings")), None)
-            elif mentioned_metric_kw in ("quantity", "units"):
-                resolved_metric = next((c for c in num_cols if c.lower() in ("quantity", "units", "volume")), None)
+            # 2. Normalized order id variants
+            norm_variants = ["order_id", "orderid", "orderno", "order_no", "ordernumber", "order_number", "ordernum", "order_num"]
+            norm_order_id = next((c for c in cols if c.lower() in norm_variants), None)
+            if norm_order_id:
+                resolved_metric = norm_order_id
+            else:
+                # 3. Contains 'order' AND ('id', 'no', 'num', 'number', '#'), EXCLUDING customer, product, employee, vendor, transaction, invoice
+                exclude_keywords = ["customer", "product", "employee", "user", "client", "vendor", "transaction", "invoice"]
+                order_id_cand = next(
+                    (c for c in cols if "order" in c.lower() and any(kw in c.lower() for kw in ["id", "no", "num", "number", "#"]) and not any(ex in c.lower() for ex in exclude_keywords)),
+                    None
+                )
+                if order_id_cand:
+                    resolved_metric = order_id_cand
+                else:
+                    # 4. Generic 'ID' / 'id' ONLY as last resort if no other order col exists AND no specific other entity ID exists
+                    has_other_entity_ids = any(any(ex in c.lower() for ex in exclude_keywords) for c in cols)
+                    if not has_other_entity_ids:
+                        generic_id = next((c for c in cols if c.lower() in ("id", "row_id", "row id")), None)
+                        if generic_id:
+                            resolved_metric = generic_id
 
-    if not resolved_metric and num_cols:
-        resolved_metric = num_cols[0]
+        if not resolved_metric:
+            # Fallback to any column containing 'order'
+            resolved_metric = next((c for c in cols if "order" in c.lower()), None)
+            if not resolved_metric:
+                # If no order column exists, select first column that is NOT an excluded identifier
+                exclude_keywords = ["customer", "product", "employee", "user", "client", "vendor", "transaction", "invoice"]
+                resolved_metric = next(
+                    (c for c in cols if not any(ex in c.lower() for ex in exclude_keywords)),
+                    None
+                )
 
-    # 3. Aggregation & Sort Direction & Limit
-    if any(k in q_lower for k in ["average", "mean"]):
-        agg = "mean"
+        if any(w in q_lower for w in ["distinct", "unique"]):
+            agg = "nunique"
+        else:
+            agg = "count"
+
     else:
-        agg = "sum"
+        metric_keywords = ["sales", "amount", "revenue", "profit", "quantity", "units", "spend", "turnover"]
+        mentioned_metric_kw = next((kw for kw in metric_keywords if kw in q_lower), None)
 
-    if any(k in q_lower for k in ["lowest", "worst", "least", "bottom"]):
+        if mentioned_metric_kw:
+            exact_col = next((c for c in num_cols if c.lower() == mentioned_metric_kw), None)
+            if exact_col:
+                resolved_metric = exact_col
+            else:
+                if mentioned_metric_kw in ("sales", "total sales"):
+                    resolved_metric = next((c for c in num_cols if c.lower() in ("sales", "amount", "revenue")), None)
+                elif mentioned_metric_kw == "revenue":
+                    resolved_metric = next((c for c in num_cols if c.lower() in ("revenue", "sales", "amount")), None)
+                elif mentioned_metric_kw == "amount":
+                    resolved_metric = next((c for c in num_cols if c.lower() in ("amount", "sales", "revenue")), None)
+                elif mentioned_metric_kw == "profit":
+                    resolved_metric = next((c for c in num_cols if c.lower() in ("profit", "net_profit", "earnings")), None)
+                elif mentioned_metric_kw in ("quantity", "units"):
+                    resolved_metric = next((c for c in num_cols if c.lower() in ("quantity", "units", "volume")), None)
+
+        if not resolved_metric and num_cols:
+            resolved_metric = num_cols[0]
+
+        if any(k in q_lower for k in ["average", "mean"]):
+            agg = "mean"
+        else:
+            agg = "sum"
+
+    # 3. Sort Direction & Limit & Ranking Intent Distinctions
+    is_ranking = any(k in q_lower for k in ["highest", "worst", "top", "bottom", "most", "least", "best", "rank", "peak", "lowest", "fewest"])
+    if any(k in q_lower for k in ["lowest", "worst", "least", "bottom", "fewest"]):
         sort_dir = "ascending"
     else:
         sort_dir = "descending"
 
+    # For pure temporal breakdown without explicit ranking (e.g. "orders each month"), default to ascending (chronological)
+    if time_grain and not is_ranking and not any(k in q_lower for k in ["lowest", "least", "fewest"]):
+        sort_dir = "ascending"
+
     limit_val = None
-    lim_match = re.search(r"(?:top|first|highest|lowest)\s*(\d+)", q_lower)
+    lim_match = re.search(r"(?:top|first|highest|lowest|bottom|best|worst)\s*(\d+)", q_lower)
     if lim_match:
         limit_val = int(lim_match.group(1))
+    elif is_ranking and any(re.search(rf"\b{kw}\b", q_lower) for kw in ["which month", "which year", "which quarter", "which state", "which city", "which category"]):
+        limit_val = 1
 
     return {
         "dimension": resolved_dim,
@@ -145,6 +452,9 @@ def resolve_query_intent(query: str, target_df: pd.DataFrame) -> Dict[str, Any]:
         "aggregation": agg,
         "sort_direction": sort_dir,
         "limit": limit_val,
+        "time_grain": time_grain,
+        "is_ranking": is_ranking,
+        "is_exploratory": is_exploratory,
         "is_explicit_id_request": is_explicit_id_request,
     }
 
@@ -162,6 +472,29 @@ def build_heuristic_plan(query: str, target_df: pd.DataFrame) -> AnalysisPlan:
     steps: List[AnalysisPlanStep] = []
     rec_vis = False
 
+    intent = resolve_query_intent(query, target_df)
+    if intent.get("is_exploratory"):
+        best_step, best_score, best_finding = select_best_exploratory_candidate(target_df)
+        if best_step and best_score >= 0.50:
+            steps.append(best_step)
+            rec_vis = True
+            return AnalysisPlan(
+                analysis_goal=f"Execute analysis for query: '{query}'",
+                steps=steps,
+                recommended_visualization=rec_vis,
+            )
+        else:
+            steps.append(AnalysisPlanStep(
+                tool_name="aggregate_data",
+                params={"aggregations": {cols[0]: ["count"]}},
+                purpose="No strong empirical pattern found."
+            ))
+            return AnalysisPlan(
+                analysis_goal="No strong empirical pattern was found in the available data.",
+                steps=steps,
+                recommended_visualization=False,
+            )
+
     # Filter pattern
     filter_step = None
     age_col = next((c for c in num_cols if "age" in c.lower()), None)
@@ -177,8 +510,8 @@ def build_heuristic_plan(query: str, target_df: pd.DataFrame) -> AnalysisPlan:
             )
             steps.append(filter_step)
 
-    # Trend Query Pattern
-    if any(k in q_lower for k in ["trend", "over time", "monthly", "quarterly", "growth"]) and (date_cols or len(cols) >= 2):
+    # Trend Query Pattern (e.g. "trend", "growth", "over time")
+    if any(k in q_lower for k in ["trend", "trends", "over time", "growth"]) and (date_cols or len(cols) >= 2):
         d_col = date_cols[0] if date_cols else cols[0]
         v_col = num_cols[0] if num_cols else cols[-1]
         steps.append(AnalysisPlanStep(
@@ -216,7 +549,7 @@ def build_heuristic_plan(query: str, target_df: pd.DataFrame) -> AnalysisPlan:
         ))
 
     # Grouping / Category / Top Query Pattern
-    elif any(k in q_lower for k in ["top", "best", "worst", "highest", "lowest", "total", "average", "mean", "sum", "by ", "group"]) or len(cols) >= 2:
+    elif any(k in q_lower for k in ["top", "best", "worst", "highest", "lowest", "total", "average", "mean", "sum", "by ", "group", "each", "per", "monthly", "weekly", "yearly", "quarterly", "daily"]) or len(cols) >= 2:
         intent = resolve_query_intent(query, target_df)
         g_col = intent["dimension"]
         v_col = intent["metric"]
@@ -227,8 +560,12 @@ def build_heuristic_plan(query: str, target_df: pd.DataFrame) -> AnalysisPlan:
             pass
         elif g_col and v_col:
             aggs = {v_col: [intent["aggregation"]]}
-            s_by = f"{v_col}_{intent['aggregation']}"
-            s_dir = intent["sort_direction"]
+            if intent["time_grain"] and not intent["is_ranking"]:
+                s_by = g_col
+                s_dir = "ascending"
+            else:
+                s_by = f"{v_col}_{intent['aggregation']}"
+                s_dir = intent["sort_direction"]
 
             group_params: Dict[str, Any] = {
                 "group_by": [g_col],
@@ -236,13 +573,15 @@ def build_heuristic_plan(query: str, target_df: pd.DataFrame) -> AnalysisPlan:
                 "sort_by": s_by,
                 "sort_direction": s_dir,
             }
+            if intent["time_grain"]:
+                group_params["time_grain"] = intent["time_grain"]
             if intent["limit"]:
                 group_params["limit"] = intent["limit"]
 
             steps.append(AnalysisPlanStep(
                 tool_name="group_data",
                 params=group_params,
-                purpose=f"Group by {g_col} and calculate {intent['aggregation']} for {v_col}"
+                purpose=f"Group by {g_col} ({intent['time_grain'] or 'raw'}) and calculate {intent['aggregation']} for {v_col}"
             ))
             rec_vis = True
 
@@ -339,6 +678,9 @@ def validate_analysis_plan(
             query_goal = plan.analysis_goal or ""
             intent = resolve_query_intent(query_goal, target_df)
 
+            if intent.get("time_grain") and not params.get("time_grain"):
+                params["time_grain"] = intent["time_grain"]
+
             # 1. Identifier protection check
             id_cols_used = [c for c in g_cols if c in df_cols and is_identifier_column(c, target_df[c])]
             if id_cols_used and not intent["is_explicit_id_request"]:
@@ -346,15 +688,18 @@ def validate_analysis_plan(
                     f"Step {idx+1} ({t_name}) validation error: Cannot group by identifier column(s) {id_cols_used} unless explicitly requested by user."
                 )
                 if intent["dimension"] and intent["metric"]:
+                    g_params = {
+                        "group_by": [intent["dimension"]],
+                        "aggregations": {intent["metric"]: [intent["aggregation"]]},
+                        "sort_by": f"{intent['metric']}_{intent['aggregation']}",
+                        "sort_direction": intent["sort_direction"],
+                        "limit": intent["limit"],
+                    }
+                    if intent["time_grain"]:
+                        g_params["time_grain"] = intent["time_grain"]
                     step = AnalysisPlanStep(
                         tool_name="group_data",
-                        params={
-                            "group_by": [intent["dimension"]],
-                            "aggregations": {intent["metric"]: [intent["aggregation"]]},
-                            "sort_by": f"{intent['metric']}_{intent['aggregation']}",
-                            "sort_direction": intent["sort_direction"],
-                            "limit": intent["limit"],
-                        },
+                        params=g_params,
                         purpose=f"Group by {intent['dimension']} and calculate {intent['aggregation']} for {intent['metric']}",
                     )
                     warnings.append(
@@ -370,15 +715,18 @@ def validate_analysis_plan(
                     warnings.append(
                         f"Step {idx+1} ({t_name}) semantic mismatch: Planned group column '{primary_planned_dim}' does not match requested dimension '{intent['requested_dim_term']}' (resolved to '{intent['dimension']}')."
                     )
+                    g_params = {
+                        "group_by": [intent["dimension"]],
+                        "aggregations": {intent["metric"]: [intent["aggregation"]]} if intent["metric"] else params.get("aggregations", {}),
+                        "sort_by": f"{intent['metric']}_{intent['aggregation']}" if intent["metric"] else params.get("sort_by"),
+                        "sort_direction": intent["sort_direction"],
+                        "limit": intent["limit"],
+                    }
+                    if intent["time_grain"]:
+                        g_params["time_grain"] = intent["time_grain"]
                     step = AnalysisPlanStep(
                         tool_name="group_data",
-                        params={
-                            "group_by": [intent["dimension"]],
-                            "aggregations": {intent["metric"]: [intent["aggregation"]]} if intent["metric"] else params.get("aggregations", {}),
-                            "sort_by": f"{intent['metric']}_{intent['aggregation']}" if intent["metric"] else params.get("sort_by"),
-                            "sort_direction": intent["sort_direction"],
-                            "limit": intent["limit"],
-                        },
+                        params=g_params,
                         purpose=f"Group by {intent['dimension']} and calculate {intent['aggregation']} for {intent['metric'] or 'values'}",
                     )
                     warnings.append(f"Re-planned Step {idx+1} to group by validated dimension '{intent['dimension']}'.")
@@ -441,10 +789,54 @@ def validate_analysis_plan(
 
         valid_steps.append(step)
 
+    # Validation Rule: Ranking or Temporal questions MUST contain group_data step
+    query_goal = plan.analysis_goal or ""
+    intent = resolve_query_intent(query_goal, target_df)
+
+    has_valid_temporal_analysis = any(
+        (s.tool_name == "group_data" and intent["dimension"] in s.params.get("group_by", []))
+        or (s.tool_name == "analyze_trend")
+        for s in valid_steps
+    )
+    is_ranking_dimension_query = (
+        bool(intent["dimension"]) and 
+        bool(intent["requested_dim_term"]) and
+        any(kw in query_goal.lower() for kw in ["which", "highest", "lowest", "top", "bottom", "most", "least", "best", "worst", "rank"])
+    )
+    is_temporal_grouping_query = bool(intent["time_grain"]) and bool(intent["dimension"])
+
+    if (is_ranking_dimension_query or is_temporal_grouping_query) and not has_valid_temporal_analysis:
+        warnings.append(
+            f"Plan validation error: Query '{query_goal}' requires grouping on '{intent['dimension']}' but plan lacks a valid group_data step. Re-planning with group_data."
+        )
+        g_col = intent["dimension"]
+        v_col = intent["metric"] or list(target_df.columns)[0]
+        agg_func = intent["aggregation"]
+        s_by = f"{v_col}_{agg_func}"
+        s_dir = intent["sort_direction"]
+        
+        group_params = {
+            "group_by": [g_col],
+            "aggregations": {v_col: [agg_func]},
+            "sort_by": s_by,
+            "sort_direction": s_dir,
+        }
+        if intent["time_grain"]:
+            group_params["time_grain"] = intent["time_grain"]
+        if intent["limit"]:
+            group_params["limit"] = intent["limit"]
+
+        replanned_step = AnalysisPlanStep(
+            tool_name="group_data",
+            params=group_params,
+            purpose=f"Group by {g_col} ({intent['time_grain'] or 'raw'}) and calculate {agg_func} for {v_col}",
+        )
+        valid_steps = [replanned_step]
+
     validated_plan = AnalysisPlan(
         analysis_goal=plan.analysis_goal,
         steps=valid_steps,
-        recommended_visualization=plan.recommended_visualization,
+        recommended_visualization=plan.recommended_visualization or is_ranking_dimension_query or is_temporal_grouping_query,
     )
     return validated_plan, warnings
 
@@ -541,6 +933,7 @@ def execute_analysis_plan(
                 s_by = params.get("sort_by")
                 s_dir = params.get("sort_direction")
                 lim = params.get("limit")
+                t_grain = params.get("time_grain")
                 res = group_data(
                     df=current_df,
                     group_by=g_cols,
@@ -548,6 +941,7 @@ def execute_analysis_plan(
                     sort_by=s_by,
                     sort_direction=s_dir,
                     limit=lim,
+                    time_grain=t_grain,
                 )
                 quantitative_results[step_key] = res
                 executed_call_record["status"] = "success"
@@ -734,9 +1128,21 @@ def format_empirical_findings(
             if rows:
                 first_row = rows[0]
                 metric_keys = [k for k in first_row.keys() if k not in g_cols_list]
-                target_k = sort_b if (sort_b and sort_b in first_row) else (metric_keys[0] if metric_keys else None)
+                target_k = sort_b if (sort_b and sort_b in metric_keys) else (metric_keys[0] if metric_keys else None)
 
-                if target_k and g_cols_list:
+                is_temporal = any(kw in g_cols.lower() for kw in ["date", "month", "year", "quarter", "week", "day"]) or (res.get("time_grain") is not None)
+                is_ranking = res.get("is_ranking", False) or (lim is not None and lim > 0) or any(kw in sort_dir.lower() for kw in ["desc", "descending"])
+
+                if is_temporal and not is_ranking and target_k and g_cols_list:
+                    primary_g = g_cols_list[0]
+                    period_strs = [
+                        f"{r.get(primary_g, 'N/A')}: {r.get(target_k)}"
+                        for r in rows
+                    ]
+                    findings.append(
+                        f"Temporal breakdown grouped by '{g_cols}' ({row_cnt} periods): {', '.join(period_strs)}."
+                    )
+                elif target_k and g_cols_list:
                     primary_g = g_cols_list[0]
                     is_rev = sort_dir.lower() in ["descending", "desc"]
                     sorted_rows = sorted(
@@ -785,6 +1191,12 @@ def format_empirical_findings(
         elif "calculate_correlation" in step_key:
             cols = res.get("columns", [])
             findings.append(f"Calculated pairwise correlation matrix across {len(cols)} columns: {', '.join(cols)}.")
+
+        elif "detect_anomalies" in step_key:
+            col = res.get("column", "")
+            cnt = res.get("anomaly_count", 0)
+            findings.append(f"Anomaly detection on '{col}': detected {cnt} statistical outliers.")
+
 
         elif "custom_sandbox" in step_key:
             output = res.get("output", "")
@@ -850,21 +1262,110 @@ def generate_analyst_findings(
         return format_empirical_findings(quantitative_results, errors)
 
 
+def _execute_secondary_drilldown(
+    primary_step: Optional[AnalysisPlanStep],
+    quantitative_results: Dict[str, Any],
+    df: pd.DataFrame,
+) -> Dict[str, Any]:
+    """Deterministically plans and executes secondary segment drill-down on the top primary segment.
+
+    Runs ONLY if a valid secondary dimension exists (2 <= nunique <= 50, obs >= 5),
+    excluding identifier columns and the primary grouping column.
+    Guaranteed fail-safe: returns status='skipped' or status='success', never raises error.
+    """
+    from app.data.metadata import is_identifier_column
+
+    try:
+        if not primary_step or primary_step.tool_name != "group_data":
+            return {"status": "skipped", "reason": "Primary step is not group_data."}
+
+        step1_res = quantitative_results.get("step_1_group_data", {})
+        rows = step1_res.get("rows", [])
+        if not rows:
+            return {"status": "skipped", "reason": "No primary group rows produced."}
+
+        g_cols = primary_step.params.get("group_by", [])
+        if not g_cols:
+            return {"status": "skipped", "reason": "Primary step has no group_by columns."}
+
+        primary_dim = g_cols[0]
+        top_row = rows[0]
+        top_seg_val = top_row.get(primary_dim)
+        if top_seg_val is None:
+            for k, v in top_row.items():
+                if k.lower() == primary_dim.lower():
+                    top_seg_val = v
+                    break
+        if top_seg_val is None:
+            first_k = list(top_row.keys())[0] if top_row else None
+            if first_k:
+                top_seg_val = top_row[first_k]
+
+        if top_seg_val is None or str(top_seg_val).strip() == "":
+            return {"status": "skipped", "reason": "Top primary segment value is empty."}
+
+        if primary_step.params.get("time_grain") == "month":
+            parsed_dates = pd.to_datetime(df[primary_dim], format="mixed", dayfirst=True, errors="coerce")
+            filtered_df = df[parsed_dates.dt.strftime("%Y-%m") == str(top_seg_val)].copy()
+        else:
+            filtered_df = df[df[primary_dim] == top_seg_val].copy()
+
+        if len(filtered_df) < 3:
+            return {"status": "skipped", "reason": "Insufficient observations in top primary segment."}
+
+        cols = list(df.columns)
+        dt_col, _ = resolve_datetime_column(df)
+        cand_sec_dims = [
+            c for c in cols
+            if c != primary_dim 
+            and c != dt_col 
+            and not is_identifier_column(c, df[c]) 
+            and (2 <= filtered_df[c].nunique() <= 50)
+            and not any(kw in c.lower() for kw in ["date", "time", "year", "quarter", "month", "day"])
+        ]
+
+        if not cand_sec_dims:
+            return {"status": "skipped", "reason": "No valid secondary dimension found."}
+
+        sec_dim = cand_sec_dims[0]
+
+        aggs = primary_step.params.get("aggregations", {})
+        metric_col = list(aggs.keys())[0] if aggs else next((c for c in cols if c != sec_dim and not is_identifier_column(c, df[c])), cols[0])
+        agg_func = list(aggs[metric_col])[0] if (aggs and metric_col in aggs) else "count"
+
+        sec_res = group_data(
+            df=filtered_df,
+            group_by=[sec_dim],
+            aggregations={metric_col: [agg_func]},
+            sort_by=f"{metric_col}_{agg_func}",
+            sort_direction="descending",
+            limit=5,
+        )
+
+        return {
+            "status": "success",
+            "primary_dimension": primary_dim,
+            "primary_segment": top_seg_val,
+            "grouping_dimension": sec_dim,
+            "metric": metric_col,
+            "aggregation": agg_func,
+            "rows": sec_res.get("rows", []),
+            "result_row_count": sec_res.get("result_row_count", 0),
+            "warnings": [],
+        }
+
+    except Exception as e:
+        logger.warning(f"Secondary drill-down execution skipped due to error: {e}")
+        return {"status": "skipped", "reason": f"Execution error: {str(e)}", "warnings": [str(e)]}
+
+
 def run_analyst_agent(
     query: str,
     dataset_id: Optional[str] = None,
     df: Optional[pd.DataFrame] = None,
     llm: Optional[BaseChatModel] = None,
 ) -> AnalystOutput:
-    """Executes the Data Analyst Agent node using modular planner-validator-executor design.
-
-    1. Resolves target DataFrame safely (handles invalid dataset ID, empty DataFrame).
-    2. Generates analysis plan (LLM planner or heuristic fallback).
-    3. Validates analysis plan against tool registry and dataset schema.
-    4. Executes analysis plan step-by-step with DataFrame chaining.
-    5. Determines visualization recommendation using application rules.
-    6. Generates findings strictly based on actual quantitative tool results.
-    """
+    """Executes the Data Analyst Agent node using modular planner-validator-executor design."""
     try:
         target_df = _resolve_dataframe(dataset_id, df)
     except Exception as e:
@@ -910,7 +1411,6 @@ def run_analyst_agent(
     validated_plan, validation_errors = validate_analysis_plan(plan, target_df)
 
     if not validated_plan.steps:
-        # Fallback to heuristic plan if validation stripped all invalid steps
         heur_plan = build_heuristic_plan(query, target_df)
         validated_plan, heur_errors = validate_analysis_plan(heur_plan, target_df)
         validation_errors.extend(heur_errors)
@@ -925,17 +1425,26 @@ def run_analyst_agent(
         validated_plan, target_df, dataset_id
     )
 
+    # 4. Secondary Segment Drill-Down Stage (Fail-safe, separate post-execution stage)
+    if status == "success" and validated_plan.steps:
+        primary_step = validated_plan.steps[0]
+        drilldown_res = _execute_secondary_drilldown(primary_step, quantitative_results, target_df)
+        quantitative_results["step_2_drilldown"] = drilldown_res
+
     all_errors = validation_errors + execution_errors
 
-    # 4. Determine Visualization
+    # 5. Determine Visualization
     requires_vis = determine_requires_visualization(
         query, validated_plan, quantitative_results, status
     )
 
-    # 5. Generate Findings
-    findings_text = generate_analyst_findings(
-        query, context_text, quantitative_results, all_errors, agent_llm
-    )
+    # 6. Generate Findings
+    if "No strong empirical pattern" in (validated_plan.analysis_goal or ""):
+        findings_text = "No strong empirical pattern was found in the available data."
+    else:
+        findings_text = generate_analyst_findings(
+            query, context_text, quantitative_results, all_errors, agent_llm
+        )
 
     return AnalystOutput(
         analysis_goal=validated_plan.analysis_goal,
@@ -947,3 +1456,4 @@ def run_analyst_agent(
         requires_visualization=requires_vis,
         errors=all_errors,
     )
+
