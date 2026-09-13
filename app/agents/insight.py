@@ -1,4 +1,5 @@
 import logging
+import re
 import pandas as pd
 from typing import Optional, Dict, Any, List
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -30,6 +31,12 @@ def calculate_confidence_score(
         return 0.0
 
     score = 1.0
+
+    # If analyst produced exploratory metadata with overall candidate score, use it as baseline
+    if analyst_output and analyst_output.quantitative_results:
+        exp_meta = analyst_output.quantitative_results.get("exploratory_metadata")
+        if isinstance(exp_meta, dict) and "overall_score" in exp_meta:
+            score = float(exp_meta["overall_score"])
 
     # Quality score penalty
     try:
@@ -82,6 +89,23 @@ def is_hypothesis_relevant_to_query(h: Dict[str, Any], query: str, active_cols: 
     return has_target or has_group
 
 
+def parse_requested_insight_count(query: str) -> int:
+    """Parses requested insight count from user query (defaults to 3)."""
+    q_lower = query.lower()
+    match = re.search(r"\b(\d+)\s*(?:most\s+important\s+)?(?:insights?|patterns?|findings?)\b", q_lower)
+    if match:
+        try:
+            val = int(match.group(1))
+            return max(1, val)
+        except ValueError:
+            pass
+    word_map = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+    for word, val in word_map.items():
+        if re.search(rf"\b{word}\s*(?:most\s+important\s+)?(?:insights?|patterns?|findings?)\b", q_lower):
+            return val
+    return 3
+
+
 def generate_empirical_insight(
     query: str,
     target_df: pd.DataFrame,
@@ -108,12 +132,48 @@ def generate_empirical_insight(
         )
 
     findings = analyst_output.findings_summary if analyst_output else f"Dataset analyzed containing {len(target_df)} rows."
-    exec_summary = f"Executive Summary for '{query}': {findings}"
+    is_exploratory_mode = False
+    if analyst_output and analyst_output.quantitative_results:
+        is_exploratory_mode = analyst_output.quantitative_results.get("exploratory_metadata", {}).get("is_exploratory", False)
+    if analyst_output and "No strong empirical pattern" in (analyst_output.findings_summary or ""):
+        is_exploratory_mode = True
 
     insights: List[str] = []
     recommendations: List[str] = []
     relevant_hypotheses: List[Dict[str, Any]] = []
     relevant_struct_insights: List[Dict[str, Any]] = []
+
+    if is_exploratory_mode and analyst_output and analyst_output.findings_summary:
+        import re
+        clean_summary = analyst_output.findings_summary.split("Execution warnings:")[0].strip()
+        
+        if "No strong empirical pattern" in clean_summary or not clean_summary:
+            real_findings = []
+        else:
+            parts = re.split(r"(?<=\.|\))\s+(?=\d+\.\s)", clean_summary)
+            real_findings = [p.strip() for p in parts if p.strip() and not p.strip().startswith("(Note:")]
+
+        pattern_cnt = len(real_findings)
+        requested_cnt = parse_requested_insight_count(query)
+
+        if pattern_cnt == 0:
+            exec_summary = f"Executive Summary for '{query}': No strong empirical patterns were identified in the dataset."
+            insights.append("No strong empirical patterns met the significance threshold in the dataset.")
+        elif pattern_cnt < requested_cnt:
+            p_str = "1 strong empirical pattern was" if pattern_cnt == 1 else f"{pattern_cnt} strong empirical patterns were"
+            exec_summary = f"Executive Summary for '{query}': {p_str} identified; no additional findings were included without sufficient supporting evidence."
+        else:
+            p_str = "1 strong empirical pattern was" if pattern_cnt == 1 else f"{pattern_cnt} strong empirical patterns were"
+            exec_summary = f"Executive Summary for '{query}': {p_str} identified in the dataset."
+
+        if pattern_cnt > 0:
+            selected_items = real_findings[:requested_cnt]
+            for item in selected_items:
+                cleaned_item = re.sub(r"^\d+\.\s*", "", item).strip()
+                if cleaned_item:
+                    insights.append(cleaned_item)
+    else:
+        exec_summary = f"Executive Summary for '{query}': {findings}"
 
     # Extract active columns from analyst results
     active_cols: List[str] = []
@@ -123,8 +183,8 @@ def generate_empirical_insight(
                 active_cols.extend(res.get("group_by", []))
                 active_cols.extend(res.get("columns", []))
 
-    # Add query-specific analytical findings FIRST
-    if analyst_output and analyst_output.quantitative_results:
+    # Add query-specific analytical findings FIRST if not already added
+    if not insights and analyst_output and analyst_output.quantitative_results:
         q_res = analyst_output.quantitative_results
         for step_key, res in q_res.items():
             if isinstance(res, dict):
@@ -185,26 +245,27 @@ def generate_empirical_insight(
                     if anom_cnt > 0:
                         recommendations.append("Audit identified anomaly transactions for potential data entry errors or operational risk.")
 
-    # Contextual Automated Hypotheses & Insights (Only if relevant and explicitly separated)
-    auto_hypo = generate_automated_hypotheses(target_df, max_pairs=5)
-    auto_ins = discover_automated_insights(target_df, max_insights=3)
+    if not is_exploratory_mode:
+        # Contextual Automated Hypotheses & Insights (Only for explicit/non-exploratory queries if relevant)
+        auto_hypo = generate_automated_hypotheses(target_df, max_pairs=5)
+        auto_ins = discover_automated_insights(target_df, max_insights=3)
 
-    hypo_list = auto_hypo.get("hypotheses", [])
-    struct_insights = auto_ins.get("insights", [])
+        hypo_list = auto_hypo.get("hypotheses", [])
+        struct_insights = auto_ins.get("insights", [])
 
-    for h in hypo_list:
-        if h.get("statistical_significance") and is_hypothesis_relevant_to_query(h, query, active_cols):
-            relevant_hypotheses.append(h)
-            insights.append(f"[Additional Relevant Insight] Contextual Hypothesis: {h['statement']}")
+        for h in hypo_list:
+            if h.get("statistical_significance") and is_hypothesis_relevant_to_query(h, query, active_cols):
+                relevant_hypotheses.append(h)
+                insights.append(f"[Additional Relevant Insight] Contextual Hypothesis: {h['statement']}")
 
-    for item in struct_insights:
-        if is_hypothesis_relevant_to_query({"target_column": item.get("headline")}, query, active_cols):
-            relevant_struct_insights.append(item)
-            insights.append(f"[Additional Relevant Insight] {item['headline']}: {item['explanation']}")
+        for item in struct_insights:
+            if is_hypothesis_relevant_to_query({"target_column": item.get("headline")}, query, active_cols):
+                relevant_struct_insights.append(item)
+                insights.append(f"[Additional Relevant Insight] {item['headline']}: {item['explanation']}")
 
-    if not insights:
-        insights.append(f"Dataset schema contains {len(target_df.columns)} columns across {len(target_df)} records.")
-        insights.append(f"Empirical analysis completed with confidence score of {conf * 100}%.")
+        if not insights:
+            insights.append(f"Dataset schema contains {len(target_df.columns)} columns across {len(target_df)} records.")
+            insights.append(f"Empirical analysis completed with confidence score of {conf * 100}%.")
 
     if not recommendations:
         recommendations.append("Perform granular sub-segment comparisons for deeper quantitative insights.")

@@ -25,7 +25,7 @@ export const AgentWorkspace: React.FC = () => {
 
   const [inputQuery, setInputQuery] = useState('');
   const [activeZoomImage, setActiveZoomImage] = useState<string | null>(null);
-  const [expandedCodeId, setExpandedCodeId] = useState<string | null>(null);
+  const [expandedTechId, setExpandedTechId] = useState<string | null>(null);
 
   const samplePrompts = [
     'Analyze column totals and distributions across groups',
@@ -209,54 +209,126 @@ export const AgentWorkspace: React.FC = () => {
                     )}
 
                     {/* Analyst Findings */}
-                    {resp?.analyst && (
-                      <div style={{ backgroundColor: 'rgba(255, 255, 255, 0.02)', padding: '1rem', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-glass)' }}>
-                        <div style={{ fontWeight: 600, fontSize: '0.95rem', marginBottom: '0.5rem', color: 'var(--accent-cyan)' }}>
-                          Analytical Findings
-                        </div>
-                        <p style={{ fontSize: '0.9rem', color: 'var(--text-primary)', lineHeight: 1.5 }}>
-                          {resp.analyst.findings_summary}
-                        </p>
+                    {resp?.analyst && (() => {
+                      const fullFindings = resp.analyst.findings_summary || '';
+                      const warningRegex = /\s*(Execution warnings:|Execution warning:)\s*/i;
+                      const matchIndex = fullFindings.search(warningRegex);
 
-                        {/* Sandboxed Code Details Toggle */}
-                        {Array.isArray(resp.analyst.tool_calls_executed) && resp.analyst.tool_calls_executed.length > 0 && (
-                          <div style={{ marginTop: '0.75rem' }}>
-                            <button
-                              onClick={() => setExpandedCodeId(expandedCodeId === msg.id ? null : msg.id)}
-                              style={{
-                                background: 'none',
-                                border: 'none',
-                                color: 'var(--text-secondary)',
-                                fontSize: '0.8rem',
-                                cursor: 'pointer',
-                                display: 'flex',
-                                alignItems: 'center',
-                                gap: '0.35rem',
-                              }}
-                            >
-                              <Code size={14} /> {expandedCodeId === msg.id ? 'Hide' : 'Show'} Sandboxed Tools Executed ({resp.analyst.tool_calls_executed.length})
-                            </button>
+                      const cleanFindings = matchIndex !== -1
+                        ? fullFindings.substring(0, matchIndex).trim()
+                        : fullFindings.trim();
 
-                            {expandedCodeId === msg.id && (
-                              <pre
+                      const inlineWarnings = matchIndex !== -1
+                        ? fullFindings.substring(matchIndex).replace(/^\s*(Execution warnings:|Execution warning:)\s*/i, '').trim()
+                        : '';
+
+                      const allWarningItems: string[] = [];
+                      if (inlineWarnings) {
+                        allWarningItems.push(inlineWarnings);
+                      }
+                      if (Array.isArray(resp.analyst.errors)) {
+                        resp.analyst.errors.forEach((err) => {
+                          if (err && !allWarningItems.includes(err)) {
+                            allWarningItems.push(err);
+                          }
+                        });
+                      }
+
+                      const hasToolCalls = Array.isArray(resp.analyst.tool_calls_executed) && resp.analyst.tool_calls_executed.length > 0;
+                      const hasTechDetails = allWarningItems.length > 0 || hasToolCalls;
+                      const isTechExpanded = expandedTechId === msg.id;
+
+                      return (
+                        <div style={{ backgroundColor: 'rgba(255, 255, 255, 0.02)', padding: '1rem', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-glass)' }}>
+                          <div style={{ fontWeight: 600, fontSize: '0.95rem', marginBottom: '0.5rem', color: 'var(--accent-cyan)' }}>
+                            Analytical Findings
+                          </div>
+                          <p style={{ fontSize: '0.9rem', color: 'var(--text-primary)', lineHeight: 1.5, margin: 0 }}>
+                            {cleanFindings}
+                          </p>
+
+                          {/* Technical Execution Details Toggle */}
+                          {hasTechDetails && (
+                            <div style={{ marginTop: '0.75rem' }}>
+                              <button
+                                type="button"
+                                onClick={() => setExpandedTechId(isTechExpanded ? null : msg.id)}
                                 style={{
-                                  marginTop: '0.5rem',
-                                  padding: '0.75rem',
-                                  backgroundColor: '#070a12',
-                                  borderRadius: 'var(--radius-sm)',
-                                  fontSize: '0.775rem',
-                                  color: 'var(--accent-cyan)',
-                                  overflowX: 'auto',
-                                  fontFamily: 'var(--font-mono)',
+                                  background: 'none',
+                                  border: 'none',
+                                  color: 'var(--text-secondary)',
+                                  fontSize: '0.8rem',
+                                  cursor: 'pointer',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '0.35rem',
+                                  padding: 0,
                                 }}
                               >
-                                {JSON.stringify(resp.analyst.tool_calls_executed, null, 2)}
-                              </pre>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    )}
+                                <ChevronRight
+                                  size={14}
+                                  style={{
+                                    transform: isTechExpanded ? 'rotate(90deg)' : 'none',
+                                    transition: 'transform 0.2s ease',
+                                  }}
+                                />
+                                {isTechExpanded ? 'Hide' : 'Show'} Technical Execution Details
+                              </button>
+
+                              {isTechExpanded && (
+                                <div
+                                  style={{
+                                    marginTop: '0.5rem',
+                                    padding: '0.85rem',
+                                    backgroundColor: '#070a12',
+                                    borderRadius: 'var(--radius-sm)',
+                                    border: '1px solid var(--border-glass)',
+                                    display: 'flex',
+                                    flexDirection: 'column',
+                                    gap: '0.75rem',
+                                  }}
+                                >
+                                  {allWarningItems.length > 0 && (
+                                    <div>
+                                      <div style={{ fontWeight: 600, fontSize: '0.775rem', color: '#fbbf24', marginBottom: '0.35rem', display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                                        <AlertCircle size={13} /> Execution Warnings / Internal Traces:
+                                      </div>
+                                      <ul style={{ margin: 0, paddingLeft: '1.25rem', fontSize: '0.775rem', color: 'var(--text-secondary)' }}>
+                                        {allWarningItems.map((wItem, wIdx) => (
+                                          <li key={wIdx}>{wItem}</li>
+                                        ))}
+                                      </ul>
+                                    </div>
+                                  )}
+
+                                  {hasToolCalls && (
+                                    <div>
+                                      <div style={{ fontWeight: 600, fontSize: '0.775rem', color: 'var(--accent-cyan)', marginBottom: '0.35rem', display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                                        <Code size={13} /> Sandboxed Tools Executed ({resp.analyst.tool_calls_executed.length}):
+                                      </div>
+                                      <pre
+                                        style={{
+                                          margin: 0,
+                                          padding: '0.65rem',
+                                          backgroundColor: 'rgba(0, 0, 0, 0.4)',
+                                          borderRadius: 'var(--radius-sm)',
+                                          fontSize: '0.75rem',
+                                          color: 'var(--accent-cyan)',
+                                          overflowX: 'auto',
+                                          fontFamily: 'var(--font-mono)',
+                                        }}
+                                      >
+                                        {JSON.stringify(resp.analyst.tool_calls_executed, null, 2)}
+                                      </pre>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
 
                     {/* Visualization Image Viewer */}
                     {resp?.visualization && resp.visualization.base64_image && (

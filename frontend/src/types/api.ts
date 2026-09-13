@@ -119,6 +119,7 @@ export interface InsightOutput {
   strategic_recommendations: string[];
   confidence_score: number;
   limitations: string[];
+  suggested_followups?: string[];
   hypotheses?: HypothesisResult[];
   structured_insights?: AutomatedInsight[];
 }

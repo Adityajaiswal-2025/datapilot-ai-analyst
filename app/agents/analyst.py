@@ -95,18 +95,28 @@ def resolve_datetime_column(target_df: pd.DataFrame) -> Tuple[Optional[str], flo
     return None, 0.0
 
 
-def select_best_exploratory_candidate(df: pd.DataFrame) -> Tuple[Optional[AnalysisPlanStep], float, str]:
-    """Dynamically scans dataset for the strongest analytical candidate.
-    
-    Returns (plan_step, candidate_score, summary_finding).
-    Does NOT hardcode column names. Evaluates all valid non-identifier columns.
+def select_best_exploratory_candidates(
+    df: pd.DataFrame, max_candidates: int = 3
+) -> Tuple[List[AnalysisPlanStep], float, List[str], List[float]]:
+    """Dynamically scans dataset for up to max_candidates independent, high-scoring analytical candidates.
+
+    Returns (plan_steps, overall_score, summary_findings, candidate_scores).
+    Candidate types evaluated:
+    1. Temporal peak periods (group_data by datetime column)
+    2. Categorical frequency / concentration (group_data by non-identifier categorical column)
+    3. Numeric concentration / sum dominance (group_data by categorical for numeric sum)
+    4. Numeric statistical anomalies (detect_anomalies for Z-score >= 3.0)
+
+    Enforces minimum candidate strength threshold of 0.45.
+    Filters out identifier columns, constant columns, high-cardinality noise, and generic row counts.
+    Candidates are guaranteed independent.
     """
     from app.data.metadata import is_identifier_column
 
     if df.empty or len(df) < 2:
-        return None, 0.0, "No strong empirical pattern was found in the available data."
+        return [], 0.30, ["No strong empirical pattern was found in the available data."], []
 
-    candidates = []
+    candidates: List[Tuple[float, AnalysisPlanStep, str, str]] = []
     cols = list(df.columns)
     non_id_cols = [c for c in cols if not is_identifier_column(c, df[c]) and df[c].nunique() > 1]
 
@@ -151,8 +161,8 @@ def select_best_exploratory_candidate(df: pd.DataFrame) -> Tuple[Optional[Analys
                         },
                         purpose=f"Find peak month for {agg_col} over {dt_col}"
                     )
-                    finding = f"Peak monthly volume occurred in '{top_period}' with {top_val} recorded entries ({pct_above_avg}% above monthly average)."
-                    candidates.append((score, cand_step, finding))
+                    finding = f"Peak monthly volume occurred in '{top_period}' over {dt_col} with {top_val} recorded entries ({pct_above_avg}% above monthly average)."
+                    candidates.append((score, cand_step, finding, f"temporal_{dt_col}"))
         except Exception:
             pass
 
@@ -173,7 +183,6 @@ def select_best_exploratory_candidate(df: pd.DataFrame) -> Tuple[Optional[Analys
             else:
                 score = 0.20 + (share_pct / 100.0) * 0.20
 
-            # Select distinct count column (never the grouping column itself)
             count_col = next((c for c in cols if c != c_cat and not is_identifier_column(c, df[c])), None)
             if not count_col:
                 count_col = next((c for c in cols if c != c_cat), cols[0])
@@ -193,7 +202,7 @@ def select_best_exploratory_candidate(df: pd.DataFrame) -> Tuple[Optional[Analys
             )
             second_str = f", followed by '{counts.index[1]}' ({counts.iloc[1]})" if len(counts) > 1 else ""
             finding = f"Top segment in '{c_cat}' is '{top_cat}' with {top_val} entries ({share_pct}% share){second_str}."
-            candidates.append((score, cand_step, finding))
+            candidates.append((score, cand_step, finding, f"cat_count_{c_cat}"))
 
     # 3. Numeric Sum / Concentration Candidate Scan
     for c_num in num_cols:
@@ -226,9 +235,9 @@ def select_best_exploratory_candidate(df: pd.DataFrame) -> Tuple[Optional[Analys
                         purpose=f"Group by {c_cat} and calculate sum for {c_num}"
                     )
                     finding = f"Segment '{top_cat}' in '{c_cat}' leads total '{c_num}' with {top_val:,.1f} ({share_pct}% share)."
-                    candidates.append((score, cand_step, finding))
+                    candidates.append((score, cand_step, finding, f"num_sum_{c_cat}_{c_num}"))
 
-    # 4. Numeric Anomaly / Outlier Candidate Scan (for numeric columns with Z-score >= 3.0)
+    # 4. Numeric Anomaly / Outlier Candidate Scan
     for c_num in num_cols:
         s_clean = pd.to_numeric(df[c_num], errors="coerce").dropna()
         if len(s_clean) >= 5:
@@ -250,14 +259,46 @@ def select_best_exploratory_candidate(df: pd.DataFrame) -> Tuple[Optional[Analys
                         purpose=f"Detect statistical anomalies in column {c_num}"
                     )
                     finding = f"Statistical anomaly detected in '{c_num}' with outlier value {outlier_val:,.1f} (Z-score: {max_z:.2f})."
-                    candidates.append((score, cand_step, finding))
+                    candidates.append((score, cand_step, finding, f"anomaly_{c_num}"))
+
+    # Filter by minimum candidate strength threshold 0.45
+    candidates = [c for c in candidates if c[0] >= 0.45]
 
     if not candidates:
-        return None, 0.30, "No strong empirical pattern was found in the available data."
+        return [], 0.30, ["No strong empirical pattern was found in the available data."], []
 
+    # Sort candidates by score descending
     candidates.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_step, best_finding = candidates[0]
-    return best_step, best_score, best_finding
+
+    # Deduplicate candidates to ensure candidate independence without overlapping redundant target features
+    selected_steps: List[AnalysisPlanStep] = []
+    selected_findings: List[str] = []
+    selected_scores: List[float] = []
+    used_dims: set = set()
+
+    for score, step, finding, key in candidates:
+        dim = step.params.get("group_by", [step.params.get("column")])[0] if (step.params and ("group_by" in step.params or "column" in step.params)) else key
+        if dim in used_dims:
+            continue
+
+        used_dims.add(dim)
+        selected_steps.append(step)
+        selected_findings.append(finding)
+        selected_scores.append(score)
+
+        if len(selected_steps) >= max_candidates:
+            break
+
+    overall_score = round(max(selected_scores), 2) if selected_scores else 0.30
+    return selected_steps, overall_score, selected_findings, selected_scores
+
+
+def select_best_exploratory_candidate(df: pd.DataFrame) -> Tuple[Optional[AnalysisPlanStep], float, str]:
+    """Backward-compatible single-candidate scanner wrapper."""
+    steps, score, findings, scores = select_best_exploratory_candidates(df, max_candidates=1)
+    if steps:
+        return steps[0], score, findings[0]
+    return None, 0.30, "No strong empirical pattern was found in the available data."
 
 
 
@@ -265,14 +306,6 @@ def resolve_query_intent(query: str, target_df: pd.DataFrame) -> Dict[str, Any]:
     """Deterministically resolves query intent to dimension, metric, aggregation, sort_direction, limit, time_grain, is_exploratory."""
     q_lower = query.lower().strip()
     cols = list(target_df.columns)
-
-    # Check for explicit exploratory request
-    exploratory_phrases = [
-        "something interesting", "interesting", "stands out", "interesting insight",
-        "interesting insights", "what should i know", "discover insight", "discover insights",
-        "tell me about", "key findings", "explore", "find something"
-    ]
-    is_exploratory = any(phrase in q_lower for phrase in exploratory_phrases)
 
     # 1. Check for explicit identifier request in query
     explicit_id_keywords = ["order id", "customer id", "product id", "transaction id", "invoice id", "by order", "by customer", "sku"]
@@ -339,6 +372,26 @@ def resolve_query_intent(query: str, target_df: pd.DataFrame) -> Dict[str, Any]:
             if cl in q_lower or (len(cl) > 3 and cl[:-1] in q_lower):
                 resolved_dim = c
                 break
+
+    # Check for explicit exploratory request phrases
+    exploratory_phrases = [
+        "something interesting", "stands out", "interesting insight",
+        "interesting insights", "what should i know", "discover insight", "discover insights",
+        "tell me about", "key findings", "explore", "find something", "analyze this dataset",
+        "analyze dataset", "most important insights", "top insights", "key insights",
+        "discover patterns", "supporting numbers", "interesting patterns", "3 insights",
+        "three insights", "important insights", "patterns in this data", "in this dataset"
+    ]
+    has_exploratory_phrase = any(phrase in q_lower for phrase in exploratory_phrases)
+
+    # Check if user query explicitly asks for a specific known dimension or specific temporal breakdown or specific metric ask
+    has_explicit_analytical_ask = any(kw in q_lower for kw in [
+        "which state", "which city", "which category", "which month", "which year", "which quarter",
+        "highest orders", "most orders", "lowest orders", "fewest orders", "top states", "top cities",
+        "how many orders", "total number of orders", "count of orders", "total sales", "average sales"
+    ])
+
+    is_exploratory = has_exploratory_phrase and not has_explicit_analytical_ask
 
     # 2. Metric & Count Intent Resolution
     resolved_metric = None
@@ -474,14 +527,12 @@ def build_heuristic_plan(query: str, target_df: pd.DataFrame) -> AnalysisPlan:
 
     intent = resolve_query_intent(query, target_df)
     if intent.get("is_exploratory"):
-        best_step, best_score, best_finding = select_best_exploratory_candidate(target_df)
-        if best_step and best_score >= 0.50:
-            steps.append(best_step)
-            rec_vis = True
+        cand_steps, overall_score, summary_findings, cand_scores = select_best_exploratory_candidates(target_df, max_candidates=3)
+        if cand_steps and overall_score >= 0.45:
             return AnalysisPlan(
-                analysis_goal=f"Execute analysis for query: '{query}'",
-                steps=steps,
-                recommended_visualization=rec_vis,
+                analysis_goal=f"Execute exploratory analysis (score: {overall_score}) for query: '{query}'",
+                steps=cand_steps,
+                recommended_visualization=True,
             )
         else:
             steps.append(AnalysisPlanStep(
@@ -1152,14 +1203,31 @@ def format_empirical_findings(
                     )
                     top_limit = lim if (lim and lim > 0) else 5
                     top_rows = sorted_rows[:top_limit]
-                    ranked_items = [
-                        f"{idx+1}. {r.get(primary_g, 'N/A')}: {r.get(target_k)}"
-                        for idx, r in enumerate(top_rows)
-                    ]
-                    order_label = "highest" if is_rev else "lowest"
-                    findings.append(
-                        f"Ranked by '{target_k}' ({order_label}) grouped by '{g_cols}' ({row_cnt} total groups): {', '.join(ranked_items)}."
-                    )
+                    is_exploratory_mode = quantitative_results.get("exploratory_metadata", {}).get("is_exploratory", False)
+
+                    if is_exploratory_mode:
+                        top_item = top_rows[0]
+                        top_seg = top_item.get(primary_g, "N/A")
+                        top_val = top_item.get(target_k)
+                        if is_temporal:
+                            try:
+                                formatted_period = pd.to_datetime(str(top_seg), format="%Y-%m").strftime("%B %Y")
+                            except Exception:
+                                formatted_period = str(top_seg)
+                            metric_label = "monthly order volume" if "order" in str(target_k).lower() else f"monthly '{target_k}'"
+                            unit_label = "orders" if "order" in str(target_k).lower() else "entries"
+                            findings.append(f"{formatted_period} recorded the highest {metric_label}, with {top_val} {unit_label}.")
+                        else:
+                            findings.append(f"Top segment in '{g_cols}' is '{top_seg}' with {top_val} recorded entries.")
+                    else:
+                        ranked_items = [
+                            f"{idx+1}. {r.get(primary_g, 'N/A')}: {r.get(target_k)}"
+                            for idx, r in enumerate(top_rows)
+                        ]
+                        order_label = "highest" if is_rev else "lowest"
+                        findings.append(
+                            f"Ranked by '{target_k}' ({order_label}) grouped by '{g_cols}' ({row_cnt} total groups): {', '.join(ranked_items)}."
+                        )
                 else:
                     findings.append(f"Grouped by '{g_cols}' returning {row_cnt} groups.")
             else:
@@ -1217,6 +1285,25 @@ def format_empirical_findings(
             common = comp.get("common_columns", [])
             row_str = ", ".join([f"'{k}': {v} rows" for k, v in rows.items()])
             findings.append(f"Multi-dataset comparison ({row_str}): found {len(common)} common column(s) ({', '.join(common[:5])}).")
+
+    is_exploratory_mode = quantitative_results.get("exploratory_metadata", {}).get("is_exploratory", False)
+    if is_exploratory_mode:
+        real_findings = [f for f in findings if not f.startswith("Execution warnings:")]
+        warn_findings = [f for f in findings if f.startswith("Execution warnings:")]
+
+        if not real_findings:
+            full_str = "No strong empirical pattern was found in the available data."
+            warn_findings.append("Candidate note: 0 strong empirical pattern(s) were discovered meeting significance threshold.")
+        else:
+            numbered = [f"{idx+1}. {item}" for idx, item in enumerate(real_findings)]
+            if len(real_findings) < 3:
+                warn_findings.append(f"Candidate note: {len(real_findings)} strong empirical pattern(s) were discovered meeting significance threshold.")
+            full_str = " ".join(numbered)
+
+        if errors or warn_findings:
+            all_warns = errors + [w for w in warn_findings if w not in errors]
+            full_str += f" Execution warnings: {'; '.join(all_warns)}"
+        return full_str
 
     if errors:
         findings.append(f"Execution warnings: {'; '.join(errors)}")
@@ -1430,6 +1517,17 @@ def run_analyst_agent(
         primary_step = validated_plan.steps[0]
         drilldown_res = _execute_secondary_drilldown(primary_step, quantitative_results, target_df)
         quantitative_results["step_2_drilldown"] = drilldown_res
+
+    # Store exploratory metadata for confidence calculation and formatting if goal is exploratory
+    if validated_plan.analysis_goal and "exploratory analysis" in validated_plan.analysis_goal.lower():
+        score_match = re.search(r"score:\s*([\d\.]+)", validated_plan.analysis_goal)
+        exp_score = float(score_match.group(1)) if score_match else 0.85
+        quantitative_results["exploratory_metadata"] = {
+            "is_exploratory": True,
+            "overall_score": exp_score,
+            "step_count": len(executed_calls),
+            "status": status,
+        }
 
     all_errors = validation_errors + execution_errors
 
