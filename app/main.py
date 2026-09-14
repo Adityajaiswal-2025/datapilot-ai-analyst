@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from app.core.config import settings
 from app.core.logging import setup_logging
@@ -7,6 +8,17 @@ from app.api.routes import api_router
 # Initialize structured logging
 setup_logging()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI Lifespan context manager for application startup and shutdown lifecycle.
+
+    Note: Production database migrations must be executed out-of-band via Alembic:
+        alembic upgrade head
+    """
+    yield
+
+
 # Initialize FastAPI application
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -15,7 +27,9 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
     description="DataPilot — Modular AI Data Analyst Agent API Platform",
+    lifespan=lifespan,
 )
+
 
 # Apply CORS & Security configurations
 setup_security(app)

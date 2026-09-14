@@ -1,7 +1,10 @@
 import logging
 from typing import Optional, Dict, Any
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database.session import get_db_session
+from app.services.dataset_service import DatasetService
 from app.schemas.agents import (
     AgentQueryRequest,
     AgentQueryResponse,
@@ -23,7 +26,10 @@ router = APIRouter()
     summary="Execute multi-agent analytical workflow",
     description="Processes natural language queries via Supervisor StateGraph routing across specialized profiler, analyst, visualization, and insight agents.",
 )
-def execute_agent_query(req: AgentQueryRequest) -> AgentQueryResponse:
+async def execute_agent_query(
+    req: AgentQueryRequest,
+    db: AsyncSession = Depends(get_db_session),
+) -> AgentQueryResponse:
     """Executes the multi-agent DataPilot workflow for a user query."""
     if not req.query or not req.query.strip():
         raise HTTPException(
@@ -31,14 +37,10 @@ def execute_agent_query(req: AgentQueryRequest) -> AgentQueryResponse:
             detail="Query string cannot be empty.",
         )
 
-    # Validate dataset_id existence if provided
+    # Authoritative dataset resolution & RAM cache rehydration via DatasetService
     if req.dataset_id:
-        dataset_entry = get_registered_dataset(req.dataset_id)
-        if not dataset_entry:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Dataset with ID '{req.dataset_id}' not found in registry.",
-            )
+        service = DatasetService(db)
+        await service.get_dataframe(req.dataset_id)
 
     # Get or create conversation session
     session = default_session_storage.get_or_create_session(

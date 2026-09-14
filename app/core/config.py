@@ -1,5 +1,5 @@
 from typing import List, Union
-from pydantic import AnyHttpUrl, validator
+from pydantic import AnyHttpUrl, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,15 +16,25 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "DataPilot"
     VERSION: str = "0.1.0"
     API_V1_STR: str = "/api/v1"
-    DEBUG: bool = True
+    DEBUG: bool = False
     LOG_LEVEL: str = "INFO"
 
     HOST: str = "127.0.0.1"
     PORT: int = 8000
 
+    # Database & Storage Settings
+    DATABASE_URL: str = "sqlite+aiosqlite:///./datapilot.db"
+    STORAGE_PROVIDER: str = "local"
+    STORAGE_LOCAL_DIR: str = "data/uploads"
+
     # Dataset Ingestion Settings
     UPLOAD_DIR: str = "data/uploads"
+
     MAX_UPLOAD_SIZE_MB: int = 50
+    MAX_DATASET_ROWS: int = 100_000
+    MAX_DATASET_COLUMNS: int = 500
+    MAX_DATASETS_IN_MEMORY: int = 50
+    DATASET_TTL_SECONDS: int = 86400
     ALLOWED_EXTENSIONS: List[str] = [".csv", ".xlsx"]
 
     # LLM Integration Settings
@@ -42,7 +52,15 @@ class Settings(BaseSettings):
         "http://127.0.0.1:5173",
     ]
 
-
+    @field_validator("BACKEND_CORS_ORIGINS", mode="before")
+    @classmethod
+    def assemble_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
+        if isinstance(v, str) and not v.startswith("["):
+            return [i.strip() for i in v.split(",") if i.strip()]
+        elif isinstance(v, (list, str)):
+            return v
+        raise ValueError(v)
 
 
 settings = Settings()
+

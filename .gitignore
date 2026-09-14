@@ -53,6 +53,8 @@ coverage.xml
 venv/
 env/
 ENV/
+*.db
+
 
 # Data storage, uploads, & generated charts
 data/uploads/*

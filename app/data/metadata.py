@@ -1,4 +1,5 @@
 import os
+import threading
 import uuid
 import math
 import numpy as np
@@ -6,11 +7,14 @@ import pandas as pd
 from typing import Dict, Optional, List, Any
 from datetime import datetime, timezone
 from app.schemas.dataset import DatasetMetadata, ColumnSummary, DatasetSummary
-
+from app.core.config import settings
+from app.data.validator import DatasetValidationError
 
 
 # In-memory registry storing dataset metadata and loaded DataFrames
 DATASET_REGISTRY: Dict[str, Dict[str, Any]] = {}
+_registry_lock = threading.Lock()
+
 
 
 import re
@@ -134,51 +138,219 @@ def extract_metadata(
     return metadata
 
 
+def cleanup_failed_upload(storage_path: str) -> None:
+    """Safely removes a temporary file on disk if it exists (idempotent)."""
+    if storage_path and os.path.exists(storage_path):
+        try:
+            os.remove(storage_path)
+        except OSError:
+            pass
+
+
+def _is_expired_locked(entry: Dict[str, Any], ttl_seconds: Optional[int] = None) -> bool:
+    """Checks if an entry has exceeded its TTL (caller must hold _registry_lock)."""
+    ttl = ttl_seconds if ttl_seconds is not None else settings.DATASET_TTL_SECONDS
+    if ttl <= 0:
+        return False
+    last_accessed = entry.get("last_accessed") or entry.get("created_at")
+    if not last_accessed:
+        return False
+    if isinstance(last_accessed, datetime):
+        now = datetime.now(timezone.utc)
+        if last_accessed.tzinfo is None:
+            last_accessed = last_accessed.replace(tzinfo=timezone.utc)
+        elapsed = (now - last_accessed).total_seconds()
+    else:
+        elapsed = 0
+    return elapsed > ttl
+
+
+def _delete_entry_locked(dataset_id: str, delete_file: bool = False) -> bool:
+    """Removes dataset entry from RAM registry and optionally cleans up storage file (caller must hold _registry_lock)."""
+    if dataset_id not in DATASET_REGISTRY:
+        return False
+    entry = DATASET_REGISTRY.pop(dataset_id)
+    if delete_file:
+        meta = entry.get("metadata")
+        if meta and hasattr(meta, "storage_path") and meta.storage_path:
+            cleanup_failed_upload(meta.storage_path)
+    return True
+
+
+def cleanup_expired_datasets(ttl_seconds: Optional[int] = None) -> int:
+    """Evicts all datasets older than TTL from RAM registry (idempotent, thread-safe). Does NOT delete storage files."""
+    count = 0
+    with _registry_lock:
+        expired_ids = [
+            did for did, entry in list(DATASET_REGISTRY.items())
+            if _is_expired_locked(entry, ttl_seconds)
+        ]
+        for did in expired_ids:
+            if _delete_entry_locked(did, delete_file=False):
+                count += 1
+    return count
+
+
+def _evict_ram_lru_locked(max_allowed: Optional[int] = None) -> int:
+    """Frees RAM by setting 'dataframe' to None for LRU entries until RAM count <= max_allowed.
+
+    Does NOT delete source files on disk (caller must hold _registry_lock).
+    """
+    limit = max_allowed if max_allowed is not None else settings.MAX_DATASETS_IN_MEMORY
+    count = 0
+    ram_entries = [
+        (did, entry) for did, entry in DATASET_REGISTRY.items()
+        if entry.get("dataframe") is not None
+    ]
+    while len(ram_entries) > limit:
+        lru_id, _ = min(
+            ram_entries,
+            key=lambda item: item[1].get("last_accessed") or datetime.min.replace(tzinfo=timezone.utc)
+        )
+        DATASET_REGISTRY[lru_id]["dataframe"] = None
+        count += 1
+        ram_entries = [
+            (did, entry) for did, entry in DATASET_REGISTRY.items()
+            if entry.get("dataframe") is not None
+        ]
+    return count
+
+
+def evict_lru_datasets(max_allowed: Optional[int] = None) -> int:
+    """Evicts least recently used DataFrames from RAM until count <= max_allowed (thread-safe).
+
+    Source files on disk are preserved for rehydration.
+    """
+    with _registry_lock:
+        return _evict_ram_lru_locked(max_allowed)
+
+
 def register_dataset(metadata: DatasetMetadata, df: pd.DataFrame) -> None:
-    """Registers metadata and loaded DataFrame into dataset storage registry."""
-    DATASET_REGISTRY[metadata.id] = {
-        "metadata": metadata,
-        "dataframe": df,
-    }
+    """Registers metadata and loaded DataFrame into dataset storage registry.
+
+    Enforces max rows, max columns, TTL cleanup, and RAM LRU eviction.
+    """
+    if len(df) > settings.MAX_DATASET_ROWS:
+        raise DatasetValidationError(
+            f"Dataset row count ({len(df)}) exceeds maximum allowed limit of {settings.MAX_DATASET_ROWS} rows."
+        )
+    if len(df.columns) > settings.MAX_DATASET_COLUMNS:
+        raise DatasetValidationError(
+            f"Dataset column count ({len(df.columns)}) exceeds maximum allowed limit of {settings.MAX_DATASET_COLUMNS} columns."
+        )
+
+    now = datetime.now(timezone.utc)
+    with _registry_lock:
+        # Purge TTL expired items from RAM cache
+        expired_ids = [
+            did for did, entry in list(DATASET_REGISTRY.items())
+            if _is_expired_locked(entry)
+        ]
+        for did in expired_ids:
+            _delete_entry_locked(did, delete_file=False)
+
+        DATASET_REGISTRY[metadata.id] = {
+            "metadata": metadata,
+            "dataframe": df,
+            "created_at": now,
+            "last_accessed": now,
+        }
+
+        # Evict RAM LRU DataFrames if RAM count exceeds limit
+        _evict_ram_lru_locked(settings.MAX_DATASETS_IN_MEMORY)
 
 
 def get_registered_dataset(dataset_id: str) -> Optional[Dict[str, Any]]:
-    """Retrieves dataset entry by ID."""
-    return DATASET_REGISTRY.get(dataset_id)
+    """Retrieves dataset entry by ID. If evicted from RAM, rehydrates DataFrame from disk."""
+    from app.data.loader import load_dataset
+
+    with _registry_lock:
+        entry = DATASET_REGISTRY.get(dataset_id)
+        if not entry:
+            return None
+
+        if _is_expired_locked(entry):
+            _delete_entry_locked(dataset_id, delete_file=False)
+            return None
+
+        entry["last_accessed"] = datetime.now(timezone.utc)
+
+        # Check if RAM rehydration from disk storage_path is needed
+        if entry.get("dataframe") is None:
+            meta: DatasetMetadata = entry["metadata"]
+            if meta.storage_path and os.path.exists(meta.storage_path):
+                try:
+                    df = load_dataset(meta.storage_path)
+
+                    # Re-enforce safety limits
+                    if len(df) > settings.MAX_DATASET_ROWS:
+                        raise DatasetValidationError(
+                            f"Dataset row count ({len(df)}) exceeds maximum allowed limit of {settings.MAX_DATASET_ROWS} rows."
+                        )
+                    if len(df.columns) > settings.MAX_DATASET_COLUMNS:
+                        raise DatasetValidationError(
+                            f"Dataset column count ({len(df.columns)}) exceeds maximum allowed limit of {settings.MAX_DATASET_COLUMNS} columns."
+                        )
+
+                    entry["dataframe"] = df
+                    _evict_ram_lru_locked(settings.MAX_DATASETS_IN_MEMORY)
+                except Exception:
+                    _delete_entry_locked(dataset_id, delete_file=False)
+                    return None
+            else:
+                _delete_entry_locked(dataset_id, delete_file=False)
+                return None
+
+        return entry
+
+
+
+def get_all_registered_entries() -> List[Dict[str, Any]]:
+    """Thread-safe getter returning snapshots of active dataset entries (rehydrating from disk if needed)."""
+    with _registry_lock:
+        dataset_ids = list(DATASET_REGISTRY.keys())
+
+    entries = []
+    for d_id in dataset_ids:
+        entry = get_registered_dataset(d_id)
+        if entry:
+            entries.append(entry)
+    return entries
 
 
 def list_registered_datasets() -> List[DatasetSummary]:
-    """Returns condensed dataset summaries for all registered datasets."""
-    summaries: List[DatasetSummary] = []
-    for entry in DATASET_REGISTRY.values():
-        meta: DatasetMetadata = entry["metadata"]
-        summaries.append(
-            DatasetSummary(
-                id=meta.id,
-                filename=meta.filename,
-                file_type=meta.file_type,
-                file_size_bytes=meta.file_size_bytes,
-                row_count=meta.row_count,
-                column_count=meta.column_count,
-                created_at=meta.created_at,
+    """Returns condensed dataset summaries for all valid registered datasets."""
+    with _registry_lock:
+        expired_ids = [
+            did for did, entry in list(DATASET_REGISTRY.items())
+            if _is_expired_locked(entry)
+        ]
+        for did in expired_ids:
+            _delete_entry_locked(did, delete_file=False)
+
+        summaries: List[DatasetSummary] = []
+        for entry in DATASET_REGISTRY.values():
+            meta: DatasetMetadata = entry["metadata"]
+            summaries.append(
+                DatasetSummary(
+                    id=meta.id,
+                    filename=meta.filename,
+                    file_type=meta.file_type,
+                    file_size_bytes=meta.file_size_bytes,
+                    row_count=meta.row_count,
+                    column_count=meta.column_count,
+                    created_at=meta.created_at,
+                )
             )
-        )
-    return summaries
+        return summaries
 
 
 def delete_registered_dataset(dataset_id: str) -> bool:
-    """Removes a dataset from registry and deletes stored file if present."""
-    if dataset_id not in DATASET_REGISTRY:
-        return False
+    """Removes a dataset from registry and deletes stored file if present (idempotent)."""
+    with _registry_lock:
+        return _delete_entry_locked(dataset_id, delete_file=True)
 
-    entry = DATASET_REGISTRY.pop(dataset_id)
-    meta: DatasetMetadata = entry["metadata"]
-    if os.path.exists(meta.storage_path):
-        try:
-            os.remove(meta.storage_path)
-        except OSError:
-            pass
-    return True
+
 
 
 def register_merged_dataset(df: pd.DataFrame, filename: str = "merged_dataset.csv") -> Dict[str, Any]:

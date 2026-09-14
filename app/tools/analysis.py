@@ -1,6 +1,6 @@
 import pandas as pd
 from typing import Optional, List, Dict, Any
-from app.data.metadata import get_registered_dataset, sanitize_for_json, DATASET_REGISTRY
+from app.data.metadata import get_registered_dataset, get_all_registered_entries, sanitize_for_json
 
 
 class AnalysisToolError(Exception):
@@ -14,7 +14,7 @@ def _resolve_dataframe(
     """Helper to resolve DataFrame from dataset_id or raw df parameter.
 
     If query is provided and the primary dataset does not contain requested columns,
-    checks if a merged or comprehensive dataset in DATASET_REGISTRY contains the columns.
+    checks if a merged or comprehensive dataset in registry contains the columns.
     """
     target_df = None
     if dataset_id:
@@ -25,24 +25,26 @@ def _resolve_dataframe(
     elif df is not None:
         target_df = df
 
-    if target_df is None and DATASET_REGISTRY:
+    all_entries = get_all_registered_entries()
+    if target_df is None and all_entries:
         # Pick latest registered dataset
-        target_df = list(DATASET_REGISTRY.values())[-1]["dataframe"]
+        target_df = all_entries[-1]["dataframe"]
 
     # Check if query needs columns missing from target_df but present in another registered dataset
-    if query and target_df is not None and DATASET_REGISTRY:
+    if query and target_df is not None and all_entries:
         q_lower = query.lower()
         needs_state = any(kw in q_lower for kw in ["state", "states", "province"])
         has_state = any("state" in c.lower() for c in target_df.columns)
 
         if needs_state and not has_state:
-            for entry in DATASET_REGISTRY.values():
+            for entry in all_entries:
                 candidate_df = entry.get("dataframe")
                 if candidate_df is not None and any("state" in c.lower() for c in candidate_df.columns):
                     return candidate_df
 
     if target_df is not None:
         return target_df
+
 
     raise AnalysisToolError("Either dataset_id or df must be provided.")
 

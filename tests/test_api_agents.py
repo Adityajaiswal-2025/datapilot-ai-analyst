@@ -344,4 +344,39 @@ def test_api_exploratory_query_endpoint():
         client.delete(f"/api/v1/datasets/{dataset_id}")
 
 
+def test_api_agent_query_rehydrates_after_lru_eviction_and_empty_ram():
+    """Verifies POST /api/v1/query succeeds when dataset was LRU evicted or RAM registry cleared."""
+    from app.data.metadata import DATASET_REGISTRY, evict_lru_datasets
+
+    csv_content = "Product,Price\nLaptop,1000.0\nMouse,50.0\n"
+    file = ("rehydrate_agent.csv", io.BytesIO(csv_content.encode("utf-8")), "text/csv")
+    upload_res = client.post("/api/v1/upload", files={"file": file})
+    assert upload_res.status_code == 201
+    dataset_id = upload_res.json()["dataset"]["id"]
+
+    try:
+        # 1. Force LRU RAM Eviction
+        evict_lru_datasets(max_allowed=0)
+        assert DATASET_REGISTRY[dataset_id]["dataframe"] is None
+
+        # Agent query should trigger rehydration and succeed cleanly
+        payload1 = {"query": "Audit missing values", "dataset_id": dataset_id}
+        res1 = client.post("/api/v1/query", json=payload1)
+        assert res1.status_code == 200
+        assert res1.json()["profiler"]["quality_score"] == 100.0
+
+        # 2. Force Empty RAM Cache (simulating backend restart or multi-worker routing)
+        DATASET_REGISTRY.clear()
+        assert dataset_id not in DATASET_REGISTRY
+
+        # Agent query should rehydrate dataset from DB + Storage into RAM and succeed cleanly
+        payload2 = {"query": "Summarize dataset quality", "dataset_id": dataset_id}
+        res2 = client.post("/api/v1/query", json=payload2)
+        assert res2.status_code == 200
+        assert res2.json()["profiler"] is not None
+    finally:
+        client.delete(f"/api/v1/datasets/{dataset_id}")
+
+
+
 

@@ -46,7 +46,7 @@ export const handleApiError = (error: unknown, fallbackMessage: string): string 
       }
       return `Server Error (${axiosErr.response.status}): ${axiosErr.response.statusText}`;
     } else if (axiosErr.request) {
-      return 'Unable to reach DataPilot API server. Please verify backend is running on http://127.0.0.1:8000.';
+      return 'Unable to reach the DataPilot API server. Please check your connection and try again.';
     }
   }
   return error instanceof Error ? error.message : fallbackMessage;

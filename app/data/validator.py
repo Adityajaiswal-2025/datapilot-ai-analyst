@@ -7,12 +7,32 @@ class DatasetValidationError(Exception):
     pass
 
 
+class DatasetSizeLimitError(DatasetValidationError):
+    """Custom exception raised when upload size exceeds maximum allowed limit."""
+    pass
+
+
+def validate_filename_safety(filename: str) -> str:
+    """Sanitizes user-provided filename and guards against path traversal."""
+    if not filename or not filename.strip():
+        raise DatasetValidationError("Invalid empty filename provided.")
+
+    # Strip directory components to prevent path traversal
+    safe_name = os.path.basename(filename.strip().replace("\\", "/"))
+
+    if "\x00" in safe_name or ".." in safe_name:
+        raise DatasetValidationError("Filename contains invalid or dangerous characters.")
+
+    return safe_name
+
+
 def validate_file_extension(filename: str) -> str:
     """Validates that the file extension is allowed (.csv or .xlsx)."""
-    if not filename or "." not in filename:
+    safe_name = validate_filename_safety(filename)
+    if "." not in safe_name:
         raise DatasetValidationError("Filename must include a valid extension (.csv or .xlsx).")
 
-    ext = os.path.splitext(filename)[1].lower()
+    ext = os.path.splitext(safe_name)[1].lower()
     if ext not in settings.ALLOWED_EXTENSIONS:
         allowed = ", ".join(settings.ALLOWED_EXTENSIONS)
         raise DatasetValidationError(
@@ -28,7 +48,7 @@ def validate_file_size(file_size_bytes: int) -> None:
 
     max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
     if file_size_bytes > max_bytes:
-        raise DatasetValidationError(
+        raise DatasetSizeLimitError(
             f"File size ({file_size_bytes / (1024 * 1024):.2f} MB) exceeds maximum allowed limit of {settings.MAX_UPLOAD_SIZE_MB} MB."
         )
 
@@ -38,3 +58,4 @@ def validate_dataset_file(filename: str, file_size_bytes: int) -> str:
     ext = validate_file_extension(filename)
     validate_file_size(file_size_bytes)
     return ext
+
