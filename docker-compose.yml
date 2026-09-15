@@ -1,0 +1,92 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: datapilot_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-datapilot}
+      POSTGRES_USER: ${POSTGRES_USER:-datapilot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-datapilot_secret}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-datapilot} -d $${POSTGRES_DB:-datapilot}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - datapilot_net
+    restart: unless-stopped
+
+  migrations:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: datapilot_migrations
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-datapilot}:${POSTGRES_PASSWORD:-datapilot_secret}@postgres:5432/${POSTGRES_DB:-datapilot}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - datapilot_net
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: datapilot_backend
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-datapilot}:${POSTGRES_PASSWORD:-datapilot_secret}@postgres:5432/${POSTGRES_DB:-datapilot}
+      STORAGE_LOCAL_DIR: /app/data/uploads
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-4}
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-50}
+      MAX_DATASET_ROWS: ${MAX_DATASET_ROWS:-100000}
+      MAX_DATASET_COLUMNS: ${MAX_DATASET_COLUMNS:-500}
+      MAX_DATASETS_IN_MEMORY: ${MAX_DATASETS_IN_MEMORY:-50}
+      DATASET_TTL_SECONDS: ${DATASET_TTL_SECONDS:-86400}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      - uploads_data:/app/data/uploads
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health/readiness"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - datapilot_net
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: datapilot_frontend
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - datapilot_net
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  uploads_data:
+    driver: local
+
+networks:
+  datapilot_net:
+    driver: bridge

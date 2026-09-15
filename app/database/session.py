@@ -12,10 +12,24 @@ from app.database.models.dataset import Base
 logger = logging.getLogger("datapilot.database.session")
 
 # Create SQLAlchemy Async Engine
+is_sqlite = settings.DATABASE_URL.startswith("sqlite")
+
+engine_kwargs = {
+    "echo": False,
+    "future": True,
+}
+
+if not is_sqlite:
+    engine_kwargs.update({
+        "pool_size": settings.DB_POOL_SIZE,
+        "max_overflow": settings.DB_MAX_OVERFLOW,
+        "pool_pre_ping": settings.DB_POOL_PRE_PING,
+        "pool_recycle": settings.DB_POOL_RECYCLE,
+    })
+
 engine: AsyncEngine = create_async_engine(
     settings.DATABASE_URL,
-    echo=False,
-    future=True,
+    **engine_kwargs,
 )
 
 # Async session factory

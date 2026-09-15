@@ -17,7 +17,7 @@ import pytest_asyncio
 # Configurable PostgreSQL test database URL
 POSTGRES_TEST_URL = os.getenv(
     "TEST_POSTGRES_URL",
-    "postgresql+asyncpg://postgres:postgres@localhost:5432/datapilot_test"
+    "postgresql+asyncpg://datapilot:datapilot_secret@localhost:5432/datapilot"
 )
 
 
@@ -39,9 +39,9 @@ async def pg_db_session():
     async with AsyncSessionPG() as session:
         yield session
 
-    # Drop tables after test
+    # Clean up test rows after test without dropping table schema
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+        await conn.execute(text("DELETE FROM datasets"))
     await engine.dispose()
 
 
