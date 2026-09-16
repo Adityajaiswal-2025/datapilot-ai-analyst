@@ -17,7 +17,27 @@ import type {
   RAGSearchResult,
 } from '../types/api';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api/v1';
+/**
+ * Computes the normalized API base URL.
+ * Supports configurable VITE_API_BASE_URL environment variable for production (e.g. Render).
+ * Automatically appends /api/v1 if given a bare domain host URL.
+ */
+export const getApiBaseUrl = (rawUrl?: string): string => {
+  const envUrl = rawUrl !== undefined ? rawUrl : (import.meta.env.VITE_API_BASE_URL as string | undefined);
+  if (!envUrl || !envUrl.trim()) {
+    return '/api/v1';
+  }
+  const trimmed = envUrl.trim().replace(/\/+$/, '');
+  if (!trimmed.endsWith('/api/v1')) {
+    if (trimmed.endsWith('/api')) {
+      return `${trimmed}/v1`;
+    }
+    return `${trimmed}/api/v1`;
+  }
+  return trimmed;
+};
+
+export const API_BASE_URL = getApiBaseUrl();
 
 export const apiClient = axios.create({
   baseURL: API_BASE_URL,
