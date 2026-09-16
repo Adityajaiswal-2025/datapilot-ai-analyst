@@ -3,6 +3,28 @@ from pydantic import AnyHttpUrl, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def normalize_database_url(url: str) -> str:
+    """Normalizes PostgreSQL database URLs to specify the asyncpg driver if unassigned or legacy.
+
+    Cloud platforms (Render, Heroku, Supabase, Neon) pass DATABASE_URL as:
+        postgres://... or postgresql://...
+    SQLAlchemy interprets unadorned 'postgresql://' or 'postgres://' as 'postgresql+psycopg2://',
+    which fails in DataPilot's async architecture with ModuleNotFoundError: No module named 'psycopg2'.
+    This normalizes unadorned postgres/postgresql URLs to postgresql+asyncpg://.
+    Explicit driver URLs (e.g. postgresql+asyncpg://..., sqlite://..., sqlite+aiosqlite://...)
+    are preserved.
+    """
+    if not url or not isinstance(url, str):
+        return url
+
+    if url.startswith("postgres://"):
+        return "postgresql+asyncpg://" + url[len("postgres://"):]
+    elif url.startswith("postgresql://"):
+        return "postgresql+asyncpg://" + url[len("postgresql://"):]
+
+    return url
+
+
 class Settings(BaseSettings):
     """Global Application Settings configured via environment variables."""
 
@@ -57,6 +79,11 @@ class Settings(BaseSettings):
         "http://127.0.0.1:3000",
         "http://127.0.0.1:5173",
     ]
+
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def assemble_database_url(cls, v: str) -> str:
+        return normalize_database_url(v)
 
     @field_validator("BACKEND_CORS_ORIGINS", mode="before")
     @classmethod
